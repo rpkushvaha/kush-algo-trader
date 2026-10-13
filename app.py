@@ -4,7 +4,7 @@ import numpy as np
 from datetime import datetime
 
 st.set_page_config(page_title="Kush Algo Trader", page_icon="📈", layout="wide")
-st.title("📈 Kush Algo Trader Trader — Version 1")
+st.title("📈 Kush Algo Trader — Version 1")
 st.caption("Paper trading prototype • Intraday & Swing • No live orders are sent")
 st.warning("DEMO / PAPER MODE ONLY. Demo prices are synthetic, not market quotes. This app is not connected to Zerodha and cannot place real orders.")
 
