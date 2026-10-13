@@ -1,4 +1,5 @@
-# Kush Algo Trader Trader — Version 1
+
+# Kush Algo Trader — Version 1
 
 Mobile-friendly Streamlit prototype for learning and testing an EMA/RSI strategy with simulated paper trades.
 
