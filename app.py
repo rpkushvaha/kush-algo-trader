@@ -3,12 +3,19 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 
+try:
+    import yfinance as yf
+    YF_AVAILABLE = True
+except ImportError:
+    YF_AVAILABLE = False
+
 st.set_page_config(page_title="Kush Algo Trader V2", page_icon="📈", layout="wide")
 st.title("📈 Kush Algo Trader — Version 2")
 st.caption("Historical analysis + simulated paper trading • No live broker orders")
 st.warning(
-    "PAPER / RESEARCH ONLY. Synthetic data is artificial. Uploaded CSV data is not verified "
-    "by this app. This app is not connected to Zerodha and cannot place real orders."
+    "PAPER / RESEARCH ONLY. Synthetic data is artificial. Yahoo Finance (yfinance) data is unofficial and may be "
+    "delayed or incomplete. Uploaded CSV data is not verified by this app. This app is not connected to Zerodha "
+    "and cannot place real orders."
 )
 
 with st.sidebar:
@@ -31,9 +38,8 @@ if fast_ema >= slow_ema:
     st.error("Fast EMA must be smaller than Slow EMA.")
     st.stop()
 
-st.subheader("1. Choose data")
-data_source = st.radio("Data source", ["Synthetic demo data", "Upload historical OHLC CSV"], horizontal=True)
 
+# ---------- Data helpers ----------
 def make_demo_data(n=500, seed=7):
     rng = np.random.default_rng(seed)
     dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=n, freq="D")
@@ -44,41 +50,129 @@ def make_demo_data(n=500, seed=7):
     low = np.minimum(open_, close) * (1 - rng.uniform(0.001, 0.012, n))
     return pd.DataFrame({"Date": dates, "Open": open_, "High": high, "Low": low, "Close": close})
 
-if data_source == "Synthetic demo data":
+
+def clean_ohlc(df):
+    """Validate and clean an OHLC table. Raises ValueError with a readable message."""
+    required = {"Date", "Open", "High", "Low", "Close"}
+    if not required.issubset(df.columns):
+        raise ValueError("Data must contain these exact column names: Date, Open, High, Low, Close.")
+    df = df[["Date", "Open", "High", "Low", "Close"]].copy()
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    for col in ["Open", "High", "Low", "Close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Date", "Open", "High", "Low", "Close"]).sort_values("Date").reset_index(drop=True)
+    if df.empty:
+        raise ValueError("No valid rows found in the data.")
+    if (df[["Open", "High", "Low", "Close"]] <= 0).any().any():
+        raise ValueError("OHLC prices must be greater than zero.")
+    if (df["High"] < df[["Open", "Close", "Low"]].max(axis=1)).any() or (df["Low"] > df[["Open", "Close", "High"]].min(axis=1)).any():
+        raise ValueError("Some rows have inconsistent High/Low values.")
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_yf_data(yf_symbol, period, interval):
+    hist = yf.Ticker(yf_symbol).history(period=period, interval=interval, auto_adjust=False)
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    hist = hist.reset_index()
+    date_col = "Datetime" if "Datetime" in hist.columns else "Date"
+    dates = pd.to_datetime(hist[date_col])
+    if dates.dt.tz is not None:
+        dates = dates.dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    return pd.DataFrame({
+        "Date": dates,
+        "Open": hist["Open"].values,
+        "High": hist["High"].values,
+        "Low": hist["Low"].values,
+        "Close": hist["Close"].values,
+    })
+
+
+# ---------- 1. Data ----------
+st.subheader("1. Choose data")
+data_source = st.radio(
+    "Data source",
+    ["NSE/BSE real data (yfinance)", "Synthetic demo data", "Upload historical OHLC CSV"],
+    horizontal=True,
+)
+
+if data_source == "NSE/BSE real data (yfinance)":
+    if not YF_AVAILABLE:
+        st.error("yfinance is not installed. Add `yfinance` to requirements.txt and redeploy.")
+        st.stop()
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        raw_symbol = st.text_input("Stock symbol (e.g. RELIANCE, TCS, INFY)", "RELIANCE")
+    with d2:
+        exchange = st.selectbox("Exchange", ["NSE", "BSE"])
+    if mode == "Swing":
+        interval = "1d"
+        period_options = {"6 months": "6mo", "1 year": "1y", "2 years": "2y", "5 years": "5y"}
+        default_period = 1
+    else:
+        interval = "15m"
+        period_options = {"Last 5 days": "5d", "Last 1 month": "1mo"}
+        default_period = 1
+    with d3:
+        period_label = st.selectbox("Period", list(period_options.keys()), index=default_period)
+    period = period_options[period_label]
+
+    symbol = raw_symbol.strip().upper().replace(" ", "")
+    if not symbol:
+        st.info("Enter a stock symbol to load data.")
+        st.stop()
+    suffix = ".NS" if exchange == "NSE" else ".BO"
+    yf_symbol = symbol if symbol.endswith((".NS", ".BO")) or symbol.startswith("^") else symbol + suffix
+
+    st.caption(f"Fetching **{yf_symbol}** • interval: {interval} • period: {period_label}. "
+               "Intraday (15m) data from Yahoo is available only for roughly the last 60 days.")
+    try:
+        with st.spinner("Loading price data..."):
+            raw = fetch_yf_data(yf_symbol, period, interval)
+    except Exception as e:
+        st.error(f"Could not fetch data from Yahoo Finance: {e}. Try again after a minute, or use the CSV upload option.")
+        st.stop()
+    if raw.empty:
+        st.error(f"No data found for {yf_symbol}. Check the symbol spelling (use the NSE trading symbol, e.g. HDFCBANK).")
+        st.stop()
+    try:
+        df = clean_ohlc(raw)
+    except ValueError as e:
+        st.error(f"Data problem: {e}")
+        st.stop()
+    ticker = yf_symbol
+    st.success(f"Loaded {len(df)} rows for {yf_symbol} (last: {df['Date'].iloc[-1]:%d %b %Y %H:%M}).")
+
+elif data_source == "Synthetic demo data":
     df = make_demo_data()
     st.info("Synthetic demo prices are artificial and do NOT represent NSE prices. Do not use their results to judge profitability.")
     ticker = st.text_input("Symbol label", "DEMO")
+
 else:
     uploaded = st.file_uploader("Upload CSV with Date, Open, High, Low, Close columns", type=["csv"])
     if uploaded is None:
         st.info("Upload an OHLC CSV to run the backtest.")
         st.stop()
     try:
-        df = pd.read_csv(uploaded)
-        required = {"Date", "Open", "High", "Low", "Close"}
-        if not required.issubset(df.columns):
-            st.error("CSV must contain these exact column names: Date, Open, High, Low, Close.")
-            st.stop()
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-        for col in ["Open", "High", "Low", "Close"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["Date", "Open", "High", "Low", "Close"]).sort_values("Date").reset_index(drop=True)
-        if (df[["Open", "High", "Low", "Close"]] <= 0).any().any():
-            st.error("OHLC prices must be greater than zero.")
-            st.stop()
-        if (df["High"] < df[["Open", "Close", "Low"]].max(axis=1)).any() or (df["Low"] > df[["Open", "Close", "High"]].min(axis=1)).any():
-            st.error("Some rows have inconsistent High/Low values. Please correct the CSV.")
-            st.stop()
-        if df["Date"].duplicated().any():
+        raw = pd.read_csv(uploaded)
+        if "Date" in raw.columns and raw["Date"].duplicated().any():
             st.warning("Duplicate dates found. They are retained; check your CSV if this is unexpected.")
-        if len(df) < int(slow_ema + rsi_period + 5):
-            st.error("Not enough rows for selected EMA/RSI settings.")
-            st.stop()
+        df = clean_ohlc(raw)
+    except ValueError as e:
+        st.error(f"{e} Please correct the CSV.")
+        st.stop()
     except Exception as e:
         st.error(f"Could not read CSV: {e}")
         st.stop()
     ticker = st.text_input("Symbol label", "UPLOADED")
 
+if len(df) < int(slow_ema + rsi_period + 5):
+    st.error("Not enough rows for selected EMA/RSI settings. Choose a longer period or smaller EMA/RSI values.")
+    st.stop()
+
+
+# ---------- Indicators & signals ----------
 def calc_rsi(series, period):
     delta = series.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
@@ -100,7 +194,7 @@ df.loc[cross_down | (df["RSI"] >= rsi_sell_min), "Signal"] = "SELL"
 st.subheader("2. Price chart & signals")
 st.line_chart(df.set_index("Date")[["Close", "EMA_fast", "EMA_slow"]], height=320)
 st.dataframe(df.tail(15)[["Date", "Open", "High", "Low", "Close", "EMA_fast", "EMA_slow", "RSI", "Signal"]].sort_values("Date", ascending=False),
-             use_container_width=True, hide_index=True)
+             width="stretch", hide_index=True)
 last = df.iloc[-1]
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Latest close", f"₹{last['Close']:,.2f}")
@@ -108,6 +202,8 @@ c2.metric("Fast EMA", f"₹{last['EMA_fast']:,.2f}")
 c3.metric("Slow EMA", f"₹{last['EMA_slow']:,.2f}")
 c4.metric("Latest signal", last["Signal"] if last["Signal"] else "HOLD")
 
+
+# ---------- 3. Backtest ----------
 st.subheader("3. Cost-aware historical backtest")
 st.caption("Signals are generated from closing data and executed at the next row's close in this simplified model. It is not a realistic intraday fill simulator.")
 cost_per_side = (float(brokerage_pct) + float(slippage_pct)) / 100
@@ -167,13 +263,15 @@ m7.metric("Gross profit on closed trades", f"₹{gross_profit:,.2f}")
 m8.metric("Profit factor", f"{profit_factor:.2f}" if np.isfinite(profit_factor) else "∞")
 st.line_chart(df.set_index("Date")[["Equity", "BuyHold"]], height=260)
 if closed_trades:
-    st.dataframe(trade_df, use_container_width=True, hide_index=True)
+    st.dataframe(trade_df, width="stretch", hide_index=True)
     st.download_button("Download backtest trades CSV", trade_df.to_csv(index=False).encode("utf-8"),
                        file_name="kush_algo_trader_backtest_trades.csv", mime="text/csv")
 else:
     st.info("No completed BUY-to-SELL trades were found for these settings. This is not proof that the strategy is good or bad.")
 st.caption("Important limitations: simplified closing-price execution, no taxes or exchange charges breakdown, no order-book effects, and no guarantee of future results. Results from synthetic data are only for testing the interface.")
 
+
+# ---------- 4. Paper trade ticket ----------
 st.subheader("4. Paper trade ticket")
 st.write("Records a virtual trade in this app session only. No broker order is sent.")
 a, b, c = st.columns(3)
@@ -198,7 +296,7 @@ r2.metric("Stop-loss price", f"₹{stop_price:,.2f}")
 r3.metric("Target price", f"₹{target_price:,.2f}")
 if "paper_trades" not in st.session_state:
     st.session_state.paper_trades = []
-if st.button("Record PAPER trade", type="primary", use_container_width=True):
+if st.button("Record PAPER trade", type="primary", width="stretch"):
     if quantity < 1:
         st.error("Quantity is zero. Increase virtual capital or adjust risk/stop-loss.")
     else:
@@ -210,17 +308,19 @@ if st.button("Record PAPER trade", type="primary", use_container_width=True):
         st.success("Paper trade recorded.")
 if st.session_state.paper_trades:
     trades_log = pd.DataFrame(st.session_state.paper_trades)
-    st.dataframe(trades_log, use_container_width=True, hide_index=True)
+    st.dataframe(trades_log, width="stretch", hide_index=True)
     st.download_button("Download paper trades CSV", trades_log.to_csv(index=False).encode("utf-8"),
                        file_name="kush_algo_trader_paper_trades.csv", mime="text/csv")
     if st.button("Clear paper trade history"):
         st.session_state.paper_trades = []
         st.rerun()
 
+
+# ---------- 5. Safety notes ----------
 st.subheader("5. Before any live trading")
 st.markdown("""
 - This app is **not connected to Zerodha** and does not place real orders.
-- Uploaded historical data must be sourced and checked separately; this app does not fetch live or historical prices automatically.
+- Real data comes from Yahoo Finance via `yfinance`, which is unofficial, may be delayed, and can occasionally fail. Cross-check important prices with your broker.
 - Never put API secrets or access tokens in browser code, a public repository, or a mobile app.
 - Do not use this prototype for live trading without independent testing, order reconciliation, and fail-safe controls.
 """)
