@@ -64,6 +64,8 @@ def add_indicators(df, breakout_days):
     d["ATR"] = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
     d["HH"] = d["High"].rolling(int(breakout_days)).max().shift(1)
     d["MOM63"] = d["Close"] / d["Close"].shift(63) - 1
+    d["MOM126"] = d["Close"] / d["Close"].shift(126) - 1
+    d["Above200"] = d["Close"] > d["SMA200"]
     d["Trend_OK"] = (d["Close"] > d["SMA200"]) & (d["EMA20"] > d["EMA50"])
     d["Breakout"] = d["Close"] > d["HH"]
     d["Entry"] = d["Trend_OK"] & d["Breakout"] & d["ATR"].notna()
@@ -76,9 +78,12 @@ def market_filter(nifty_df):
     return nifty_df["Close"] > sma
 
 
-def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side, warmup=200):
-    """Daily portfolio simulation.
+def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side, warmup=200,
+                 exit_mode="target", trail_mult=3.0):
+    """Daily portfolio simulation for the breakout strategy.
     Signals are read at the close; entries/trend-exits happen at the next day's open.
+    exit_mode="target": fixed stop-loss + fixed target.
+    exit_mode="trail": no target; the stop rises behind the highest close (trail_mult x ATR at entry).
     Stop-loss and target are checked with each day's High/Low (stop assumed first if both are touched)."""
     if not data:
         return None
@@ -144,7 +149,9 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
             if qty < 1:
                 continue
             state["cash"] -= qty * entry_px
-            positions[s] = {"qty": qty, "entry": entry_px, "stop": o - dist, "target": o + rr * dist, "entry_date": day}
+            target = o + rr * dist if exit_mode == "target" else float("inf")
+            positions[s] = {"qty": qty, "entry": entry_px, "stop": o - dist, "target": target, "entry_date": day,
+                            "atr": atr, "high_close": o}
 
         # 3. Stop-loss / target during the day
         for s in list(positions):
@@ -159,10 +166,15 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
             elif h >= pos["target"]:
                 close_pos(s, day, max(o, pos["target"]), "Target")
 
-        # 4. Trend-exit signals at today's close
-        for s in positions:
+        # 4. Trend-exit signals at today's close; raise trailing stops
+        for s, p in positions.items():
             if A[s]["Exit"][i]:
                 pending_exits.add(s)
+            if exit_mode == "trail":
+                c = A[s]["Close"][i]
+                if not np.isnan(c) and c > p["high_close"]:
+                    p["high_close"] = c
+                p["stop"] = max(p["stop"], p["high_close"] - trail_mult * p["atr"])
 
         # 5. Mark to market
         for s in positions:
@@ -191,7 +203,8 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
 
     open_pos = [{
         "Symbol": short_name(s), "Entry date": p["entry_date"].date(), "Entry ₹": round(p["entry"], 2), "Qty": p["qty"],
-        "Last close ₹": round(last_close.get(s, p["entry"]), 2), "Stop-loss ₹": round(p["stop"], 2), "Target ₹": round(p["target"], 2),
+        "Last close ₹": round(last_close.get(s, p["entry"]), 2), "Stop-loss ₹": round(p["stop"], 2),
+        "Target ₹": round(p["target"], 2) if np.isfinite(p["target"]) else None,
         "Open P/L (₹)": round(p["qty"] * (last_close.get(s, p["entry"]) - p["entry"]), 2),
     } for s, p in positions.items()]
 
@@ -201,6 +214,125 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
         "open": pd.DataFrame(open_pos),
         "blocked_days": blocked_days,
     }
+
+
+def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
+    """Monthly momentum rotation.
+    On the last trading day of each month (at the close), rank stocks that are above their 200-day average
+    by 6-month return. Hold the top N in equal amounts. A holding is kept while it stays in the top 2N
+    (reduces churn and costs). If Nifty 50 is below its 200-day average, move to cash.
+    Orders are executed at the next day's open."""
+    if not data:
+        return None
+    dates = pd.DatetimeIndex(sorted(set().union(*[set(d.index) for d in data.values()])))
+    n = len(dates)
+    if n < warmup + 30:
+        return None
+    A = {}
+    for s, d in data.items():
+        A[s] = {c: d[c].reindex(dates).to_numpy(dtype=float) for c in ["Open", "Close", "MOM126"]}
+        A[s]["Above200"] = d["Above200"].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
+    mk = (market_ok.astype(float).reindex(dates).ffill().fillna(0).to_numpy() > 0.5) if market_ok is not None else np.ones(n, dtype=bool)
+
+    cash = float(capital)
+    holdings, last_close, trades, eq_vals = {}, {}, [], []
+    pending_target = None
+
+    def value_now(i, use_open=False):
+        total = cash
+        for s, h in holdings.items():
+            px = A[s]["Open"][i] if use_open else A[s]["Close"][i]
+            if np.isnan(px):
+                px = last_close.get(s, h["entry"])
+            total += h["qty"] * px
+        return total
+
+    for i in range(warmup, n):
+        day = dates[i]
+        # Execute last month-end decision at today's open
+        if pending_target is not None:
+            for s in list(holdings):
+                if s not in pending_target:
+                    o = A[s]["Open"][i]
+                    if np.isnan(o):
+                        continue
+                    h = holdings.pop(s)
+                    exit_px = o * (1 - cost_side)
+                    cash += h["qty"] * exit_px
+                    pnl = h["qty"] * (exit_px - h["entry"])
+                    trades.append({
+                        "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
+                        "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"],
+                        "Exit reason": "Monthly rebalance" if mk[i - 1] else "Market filter (cash)",
+                        "P/L (₹)": round(pnl, 2), "Return %": round((exit_px / h["entry"] - 1) * 100, 2),
+                        "Days held": (day - h["entry_date"]).days,
+                    })
+            slot_value = value_now(i, use_open=True) / top_n
+            for s in pending_target:
+                if s in holdings:
+                    continue
+                o = A[s]["Open"][i]
+                if np.isnan(o):
+                    continue
+                entry_px = o * (1 + cost_side)
+                qty = int(min(slot_value, cash) // entry_px)
+                if qty < 1:
+                    continue
+                cash -= qty * entry_px
+                holdings[s] = {"qty": qty, "entry": entry_px, "entry_date": day}
+            pending_target = None
+
+        for s in holdings:
+            c = A[s]["Close"][i]
+            if not np.isnan(c):
+                last_close[s] = c
+        eq_vals.append(value_now(i))
+
+        # Month-end decision
+        is_month_end = (i == n - 1) or (dates[i + 1].month != day.month)
+        if is_month_end and i < n - 1:
+            if not mk[i]:
+                pending_target = set()
+            else:
+                ranked = sorted(
+                    [(A[s]["MOM126"][i], s) for s in A
+                     if A[s]["Above200"][i] and not np.isnan(A[s]["MOM126"][i]) and A[s]["MOM126"][i] > 0],
+                    reverse=True)
+                order = [s for _, s in ranked]
+                keep = [s for s in holdings if s in order[: 2 * top_n]]
+                target = list(keep)
+                for s in order:
+                    if len(target) >= top_n:
+                        break
+                    if s not in target:
+                        target.append(s)
+                pending_target = set(target)
+
+    open_pos = [{
+        "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
+        "Last close ₹": round(last_close.get(s, h["entry"]), 2),
+        "Open P/L (₹)": round(h["qty"] * (last_close.get(s, h["entry"]) - h["entry"]), 2),
+    } for s, h in holdings.items()]
+    return {"equity": pd.Series(eq_vals, index=dates[warmup:]), "trades": pd.DataFrame(trades),
+            "open": pd.DataFrame(open_pos), "blocked_days": 0}
+
+
+def momentum_picks(data, market_ok_now, top_n):
+    rows = []
+    for s, d in data.items():
+        last = d.iloc[-1]
+        if pd.notna(last["MOM126"]):
+            rows.append({"Symbol": short_name(s), "6M return %": round(float(last["MOM126"]) * 100, 1),
+                         "Above 200-day avg": "Yes" if bool(last["Above200"]) else "No",
+                         "Close ₹": round(float(last["Close"]), 2)})
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.sort_values("6M return %", ascending=False).reset_index(drop=True)
+    eligible = (df["Above 200-day avg"] == "Yes") & (df["6M return %"] > 0)
+    df["Rank"] = np.where(eligible, eligible.cumsum(), None)
+    df["Pick"] = np.where(eligible & (df["Rank"].fillna(999).astype(int) <= top_n) & market_ok_now, "BUY / HOLD", "")
+    return df[["Rank", "Symbol", "Pick", "6M return %", "Above 200-day avg", "Close ₹"]]
 
 
 def summarize(eq, trades, capital):
@@ -290,8 +422,8 @@ def fetch_many(yf_symbols, period):
 
 # ================================== UI ==================================
 
-st.set_page_config(page_title="Kush Algo Trader V3", page_icon="📈", layout="wide")
-st.title("📈 Kush Algo Trader — Version 3")
+st.set_page_config(page_title="Kush Algo Trader V4", page_icon="📈", layout="wide")
+st.title("📈 Kush Algo Trader — Version 4")
 st.caption("Swing trading research • Nifty 50 scanner • Portfolio backtest • Paper trades • No live broker orders")
 st.warning(
     "PAPER / RESEARCH ONLY. Prices come from Yahoo Finance (unofficial, may be delayed or incomplete). "
@@ -314,7 +446,9 @@ with st.sidebar:
     st.header("Strategy")
     breakout_days = int(st.number_input("Breakout lookback (days)", min_value=10, max_value=100, value=20))
     atr_mult = st.slider("Stop-loss distance (× ATR)", 1.0, 4.0, 2.0, 0.5)
-    rr = st.slider("Target (× risk)", 1.0, 4.0, 2.0, 0.5)
+    rr = st.slider("Target (× risk), fixed-target style", 1.0, 4.0, 2.0, 0.5)
+    trail_mult = st.slider("Trailing stop distance (× ATR), trailing style", 2.0, 6.0, 3.0, 0.5)
+    top_n = int(st.number_input("Momentum: number of stocks to hold", min_value=3, max_value=15, value=5))
     use_mf = st.checkbox("Trade only when Nifty 50 is above its 200-day average", value=True)
     st.divider()
     st.header("Costs")
@@ -343,35 +477,31 @@ tab_rules, tab_scan, tab_bt, tab_stock, tab_paper = st.tabs(
 )
 
 # ------------------------------- Rules -------------------------------
+STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+
 with tab_rules:
-    st.subheader("Swing trading rules")
+    st.subheader("Three strategies, tested side by side")
     st.markdown(f"""
-**What to trade:** Nifty 50 stocks only, delivery (no leverage, no options).
+All three trade only Nifty 50 stocks, delivery (no leverage, no options).
+**Market filter:** {"new buying only when Nifty 50 is above its 200-day average" if use_mf else "OFF"}.
 
-**When to check:** once a day after 3:30 pm, on the daily chart. Orders are planned for the next morning.
+**A. Breakout + fixed target** (checked daily after 3:30 pm)
+- Buy when: close above 200-day average, EMA20 above EMA50, and close breaks the {breakout_days}-day high.
+- Stop-loss: entry − {atr_mult:g} × ATR. Target: {rr:g} × risk. Also sell on a close below EMA50.
+- Risk ₹{risk:,} per trade, max {max_pos} trades, no new trade after a ₹{daily_limit:,} loss day.
 
-**Market filter:** {"new trades only when Nifty 50 closes above its 200-day average" if use_mf else "OFF"}.
+**B. Breakout + trailing stop** (checked daily after 3:30 pm)
+- Same buy signal and starting stop as A, but **no fixed target**.
+- The stop rises behind the highest close ({trail_mult:g} × ATR below it) and never moves down. Winners are allowed to run.
 
-**Buy signal (all must be true):**
-1. Close is above the 200-day average (long-term uptrend).
-2. 20-day EMA is above the 50-day EMA (medium-term uptrend).
-3. Close is above the highest high of the previous {breakout_days} days (fresh breakout).
-
-If more stocks give a signal than free slots, the ones with the strongest 3-month rise are chosen first.
-
-**Exit (whichever comes first):**
-- Stop-loss: entry − {atr_mult:g} × ATR(14). ATR adjusts the stop to how much the stock normally moves.
-- Target: {rr:g} × the risk (e.g. risk ₹10 per share → target ₹{10*rr:g} above entry).
-- Trend exit: a close below the 50-day EMA → sell next morning.
-
-**Money rules:**
-- Risk per trade: ₹{risk:,} → quantity = ₹{risk:,} ÷ (entry − stop-loss).
-- One trade uses at most ₹{capital/max_pos:,.0f} (capital ÷ {max_pos}).
-- Max open trades: {max_pos}.
-- Max loss per day: ₹{daily_limit:,} → no new trade the next day.
-- Never move a stop-loss lower.
+**C. Monthly momentum** (checked once a month, last trading day)
+- Rank stocks above their 200-day average by 6-month return.
+- Hold the top {top_n} in equal amounts (₹{capital/top_n:,.0f} each). Keep a stock while it stays in the top {2*top_n}.
+- If Nifty 50 falls below its 200-day average, sell everything and wait in cash.
+- About 15–30 minutes of work per month.
 """)
-    st.info("These rules are a starting point to be tested, not a guarantee. Run the Backtest tab before paper trading.")
+    st.info("Run the Backtest tab and compare all three against simply holding Nifty 50. Keep the one that wins over 10 years, "
+            "then paper trade it for 2 months before using real money.")
 
 # ------------------------------ Scanner ------------------------------
 with tab_scan:
@@ -380,8 +510,10 @@ with tab_scan:
     if st.button("Scan Nifty 50 now", type="primary", width="stretch"):
         with st.spinner("Loading prices for all stocks..."):
             data, nifty, mk, failed = load_universe(symbols, "1y")
+        mk_now = bool(mk.iloc[-1]) if mk is not None and len(mk) else True
         st.session_state.scan = {
             "table": scan(data, capital, risk, max_pos, atr_mult, rr),
+            "mom": momentum_picks(data, mk_now, top_n),
             "nifty": nifty, "failed": failed,
             "time": datetime.now(IST).strftime("%d %b %Y, %I:%M %p"),
         }
@@ -391,100 +523,130 @@ with tab_scan:
         if nifty is not None and len(nifty) >= 200:
             n_close, n_sma = float(nifty["Close"].iloc[-1]), float(nifty["Close"].rolling(200).mean().iloc[-1])
             if n_close > n_sma:
-                st.success(f"Market filter: Nifty 50 ({n_close:,.0f}) is above its 200-day average ({n_sma:,.0f}). New trades allowed.")
+                st.success(f"Market filter: Nifty 50 ({n_close:,.0f}) is above its 200-day average ({n_sma:,.0f}). Buying allowed.")
             else:
                 msg = f"Market filter: Nifty 50 ({n_close:,.0f}) is below its 200-day average ({n_sma:,.0f})."
                 if use_mf:
-                    st.error(msg + " No new trades by the rules.")
+                    st.error(msg + " No new buying by the rules.")
                 else:
                     st.warning(msg + " (Filter is OFF in settings.)")
         else:
             st.warning("Could not load Nifty 50 index data, so the market filter could not be checked.")
+        st.caption(f"Scanned at {res['time']}")
+
+        st.write("### Strategy A / B: breakout signals")
         table = res["table"]
         buys = table[table["Signal"] == "BUY"] if not table.empty else table
-        st.caption(f"Scanned at {res['time']}")
         st.metric("BUY signals today", len(buys))
         if len(buys):
             st.dataframe(buys, width="stretch", hide_index=True)
-            st.caption(f"If there are more than {max_pos} signals, take the ones at the top (strongest 3-month rise) "
-                       "and only as many as your free slots.")
+            st.caption(f"Take at most your free slots (max {max_pos}), from the top. For strategy B, ignore the target column.")
         else:
-            st.info("No BUY signal today. Doing nothing is also a decision.")
-        with st.expander("All stocks"):
+            st.info("No breakout signal today.")
+        with st.expander("All stocks (breakout view)"):
             st.dataframe(table, width="stretch", hide_index=True)
+
+        st.write("### Strategy C: momentum portfolio")
+        st.caption(f"Act on this only on the last trading day of the month. Hold the stocks marked BUY / HOLD "
+                   f"(about ₹{capital/top_n:,.0f} each). Keep an old holding if its rank is {2*top_n} or better.")
+        mom = res["mom"]
+        if mom is not None and not mom.empty:
+            st.dataframe(mom.head(max(2 * top_n, 10)), width="stretch", hide_index=True)
         if res["failed"]:
             st.caption("Could not load: " + ", ".join(res["failed"]))
 
 # ------------------------------ Backtest ------------------------------
+def show_details(result, capital, nifty):
+    eq, trades = result["equity"], result["trades"]
+    s = summarize(eq, trades, capital)
+    c5, c6 = st.columns(2)
+    c5.metric("Closed trades", s["n"])
+    c6.metric("Win rate", f"{s['win_rate']:.1f}%")
+    c7, c8 = st.columns(2)
+    c7.metric("Average win / loss", f"₹{s['avg_win']:,.0f} / ₹{s['avg_loss']:,.0f}")
+    c8.metric("Profit factor", f"{s['pf']:.2f}" if np.isfinite(s["pf"]) else "∞")
+    yearly = eq.groupby(eq.index.year).last()
+    prev = yearly.shift(1).fillna(capital)
+    ytab = pd.DataFrame({"Year": yearly.index, "Strategy %": ((yearly / prev - 1) * 100).round(1).values})
+    if nifty is not None:
+        nc = nifty["Close"].reindex(eq.index).ffill().bfill()
+        ny = nc.groupby(nc.index.year).last()
+        nprev = ny.shift(1).fillna(nc.iloc[0])
+        ytab["Nifty 50 %"] = ((ny / nprev - 1) * 100).round(1).values
+    st.write("**Return by year**")
+    st.dataframe(ytab, width="stretch", hide_index=True)
+    if s["n"]:
+        st.write("**Exit reasons**")
+        st.dataframe(trades["Exit reason"].value_counts().rename_axis("Reason").reset_index(name="Trades"),
+                     width="stretch", hide_index=True)
+        st.write("**Profit / loss by stock**")
+        st.bar_chart(trades.groupby("Symbol")["P/L (₹)"].sum().sort_values(), height=300)
+        with st.expander(f"All {s['n']} trades"):
+            st.dataframe(trades, width="stretch", hide_index=True)
+            st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8"),
+                               file_name="kush_backtest_trades.csv", mime="text/csv")
+    if not result["open"].empty:
+        st.write("**Still open at the end**")
+        st.dataframe(result["open"], width="stretch", hide_index=True)
+    if result["blocked_days"]:
+        st.caption(f"Daily loss limit was hit on {result['blocked_days']} day(s).")
+
+
 with tab_bt:
-    st.subheader("Portfolio backtest (all stocks together)")
-    st.caption("Simulates the full rules on the whole list: max open trades, risk per trade, daily loss limit and costs.")
-    period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=1)
+    st.subheader("Compare all strategies")
+    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, and compares them with simply holding Nifty 50.")
+    period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
     period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[period_label]
-    if st.button("Run backtest", type="primary", width="stretch"):
-        with st.spinner("Downloading data and simulating trades... this can take a minute"):
+    if st.button("Run all backtests", type="primary", width="stretch"):
+        with st.spinner("Downloading data and simulating... this can take 1–2 minutes"):
             data, nifty, mk, failed = load_universe(symbols, period)
-            result = run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side)
-        st.session_state.bt = {"result": result, "nifty": nifty, "failed": failed, "capital": capital}
+            results = {
+                STRATS[0]: run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side, exit_mode="target"),
+                STRATS[1]: run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side,
+                                        exit_mode="trail", trail_mult=trail_mult),
+                STRATS[2]: run_momentum(data, mk, capital, top_n, cost_side),
+            }
+        st.session_state.bt = {"results": results, "nifty": nifty, "failed": failed, "capital": capital}
     bt = st.session_state.get("bt")
-    if bt:
-        result = bt["result"]
-        if result is None:
+    if bt and "results" in bt:
+        results, cap, nifty = bt["results"], bt["capital"], bt["nifty"]
+        valid = {k: v for k, v in results.items() if v is not None}
+        if not valid:
             st.error("Not enough data to run the backtest. Try a longer period.")
         else:
-            eq, trades = result["equity"], result["trades"]
-            s = summarize(eq, trades, bt["capital"])
-            st.caption(f"Test period: {eq.index[0]:%d %b %Y} to {eq.index[-1]:%d %b %Y} "
+            first = next(iter(valid.values()))["equity"]
+            st.caption(f"Test period: {first.index[0]:%d %b %Y} to {first.index[-1]:%d %b %Y} "
                        "(the first ~200 trading days are used only to calculate averages).")
-            bench = None
-            if bt["nifty"] is not None:
-                nc = bt["nifty"]["Close"].reindex(eq.index).ffill().bfill()
-                bench = bt["capital"] * nc / nc.iloc[0]
-            c1, c2 = st.columns(2)
-            c1.metric("Strategy total return", f"{s['total']:.1f}%")
-            c2.metric("Nifty 50 buy & hold", f"{(bench.iloc[-1] / bt['capital'] - 1) * 100:.1f}%" if bench is not None else "n/a")
-            c3, c4 = st.columns(2)
-            c3.metric("Yearly return (CAGR)", f"{s['cagr']:.1f}%")
-            c4.metric("Maximum drawdown", f"{s['max_dd']:.1f}%")
-            c5, c6 = st.columns(2)
-            c5.metric("Closed trades", s["n"])
-            c6.metric("Win rate", f"{s['win_rate']:.1f}%")
-            c7, c8 = st.columns(2)
-            c7.metric("Average win / loss", f"₹{s['avg_win']:,.0f} / ₹{s['avg_loss']:,.0f}")
-            c8.metric("Profit factor", f"{s['pf']:.2f}" if np.isfinite(s["pf"]) else "∞")
-            st.metric("Ending capital", f"₹{s['final']:,.0f}")
-
-            chart = pd.DataFrame({"Strategy": eq})
-            if bench is not None:
+            rows, chart = [], pd.DataFrame(index=first.index)
+            for name, r in valid.items():
+                s = summarize(r["equity"], r["trades"], cap)
+                rows.append({"Strategy": name, "Ending ₹": round(s["final"]), "Total %": round(s["total"], 1),
+                             "Yearly % (CAGR)": round(s["cagr"], 1), "Worst fall %": round(s["max_dd"], 1),
+                             "Trades": s["n"]})
+                chart[name] = r["equity"]
+            if nifty is not None:
+                nc = nifty["Close"].reindex(first.index).ffill().bfill()
+                bench = cap * nc / nc.iloc[0]
+                bs = summarize(bench, pd.DataFrame(), cap)
+                rows.append({"Strategy": "Nifty 50 buy & hold", "Ending ₹": round(bs["final"]), "Total %": round(bs["total"], 1),
+                             "Yearly % (CAGR)": round(bs["cagr"], 1), "Worst fall %": round(bs["max_dd"], 1), "Trades": 0})
                 chart["Nifty 50 buy & hold"] = bench
-            st.line_chart(chart, height=280)
+            comp = pd.DataFrame(rows).sort_values("Yearly % (CAGR)", ascending=False).reset_index(drop=True)
+            st.dataframe(comp, width="stretch", hide_index=True)
+            best = comp.iloc[0]["Strategy"]
+            if best == "Nifty 50 buy & hold":
+                st.warning("Simply holding Nifty 50 beat every strategy in this test.")
+            else:
+                st.success(f"Best yearly return in this test: {best}. Check the 'Worst fall' column too: "
+                           "a big fall is hard to sit through with real money.")
+            st.line_chart(chart, height=320)
 
-            yearly = eq.groupby(eq.index.year).last()
-            prev = yearly.shift(1).fillna(bt["capital"])
-            st.write("**Return by year**")
-            st.dataframe(pd.DataFrame({"Year": yearly.index, "Return %": ((yearly / prev - 1) * 100).round(1).values}),
-                         width="stretch", hide_index=True)
-
-            if s["n"]:
-                st.write("**Profit / loss by stock**")
-                st.bar_chart(trades.groupby("Symbol")["P/L (₹)"].sum().sort_values(), height=300)
-                st.write("**Exit reasons**")
-                st.dataframe(trades["Exit reason"].value_counts().rename_axis("Reason").reset_index(name="Trades"),
-                             width="stretch", hide_index=True)
-                with st.expander(f"All {s['n']} trades"):
-                    st.dataframe(trades, width="stretch", hide_index=True)
-                    st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8"),
-                                       file_name="kush_backtest_trades.csv", mime="text/csv")
-            if not result["open"].empty:
-                st.write("**Still open at the end**")
-                st.dataframe(result["open"], width="stretch", hide_index=True)
-            if result["blocked_days"]:
-                st.caption(f"Daily loss limit was hit on {result['blocked_days']} day(s).")
-            if s["n"] < 30:
-                st.warning(f"Only {s['n']} closed trades. That is too few to trust the result. Try 10 years.")
+            pick = st.selectbox("See details of", list(valid.keys()))
+            show_details(valid[pick], cap, nifty)
             st.caption("Limitations: uses today's Nifty 50 list for the past (makes results look better than reality), "
-                       "dividend-adjusted prices, simple cost estimate, and orders assumed to fill at the open or exactly at "
-                       "the stop/target. Gaps can cause bigger losses than planned.")
+                       "dividend-adjusted prices, simple cost estimate, no tax, and orders assumed to fill at the open or "
+                       "exactly at the stop/target. Gaps can cause bigger losses than planned. Past results do not "
+                       "guarantee future results.")
             if bt["failed"]:
                 st.caption("Could not load: " + ", ".join(bt["failed"]))
 
@@ -514,7 +676,9 @@ with tab_stock:
             a1, a2 = st.columns(2)
             a1.metric("Latest close", f"₹{last['Close']:,.2f}")
             a2.metric("Signal", sig)
-            r1 = run_backtest(data1, mk1, capital, risk, 1, daily_limit, atr_mult, rr, cost_side)
+            style = st.radio("Exit style", ["Fixed target (A)", "Trailing stop (B)"], horizontal=True)
+            r1 = run_backtest(data1, mk1, capital, risk, 1, daily_limit, atr_mult, rr, cost_side,
+                              exit_mode="target" if style.startswith("Fixed") else "trail", trail_mult=trail_mult)
             if r1 is None:
                 st.info("Not enough history for a backtest on this stock.")
             else:
