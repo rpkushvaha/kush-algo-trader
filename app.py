@@ -12,6 +12,8 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
+APP_VERSION = "1.1"
+APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
 DEFAULT_SYMBOLS = (
@@ -636,7 +638,7 @@ def data_date(data):
 
 
 def footer():
-    st.markdown('<div class="kt-foot">Paper / research only · Not investment advice · Not connected to any broker<br>'
+    st.markdown(f'<div class="kt-foot">Version {APP_VERSION} · {APP_DATE}<br>Paper / research only · Not investment advice · Not connected to any broker<br>'
                 'Prices from Yahoo Finance may be delayed or incomplete</div>', unsafe_allow_html=True)
 
 
@@ -744,10 +746,10 @@ def picks_html(df):
 
 
 # --------------------------------- Header & nav ---------------------------------
-st.markdown("""
+st.markdown(f"""
 <div class="kt-hero">
   <div class="kt-logo">K</div>
-  <div><div class="kt-title">Kush Algo Trader</div><div class="kt-sub">Momentum · Paper trading</div></div>
+  <div><div class="kt-title">Kush Algo Trader</div><div class="kt-sub">Momentum · Paper trading · v{APP_VERSION}</div></div>
   <div class="kt-badge">PAPER</div>
 </div>
 """, unsafe_allow_html=True)
