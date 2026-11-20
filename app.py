@@ -12,7 +12,7 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
@@ -79,12 +79,6 @@ def add_indicators(df, breakout_days):
     d["Breakout"] = d["Close"] > d["HH"]
     d["Entry"] = d["Trend_OK"] & d["Breakout"] & d["ATR"].notna()
     d["Exit"] = d["Close"] < d["EMA50"]
-    # Short-term pullback (strategy E): 2-day RSI (Wilder) and 5-day average
-    delta = d["Close"].diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
-    d["RSI2"] = (100 - 100 / (1 + up / dn.replace(0, np.nan))).fillna(100)
-    d["SMA5"] = d["Close"].rolling(5).mean()
     return d
 
 
@@ -94,7 +88,7 @@ def market_filter(nifty_df):
 
 
 def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side, warmup=200,
-                 exit_mode="target", trail_mult=3.0, allow=None):
+                 exit_mode="target", trail_mult=3.0):
     """Daily portfolio simulation for the breakout strategy.
     Signals are read at the close; entries/trend-exits happen at the next day's open.
     exit_mode="target": fixed stop-loss + fixed target.
@@ -111,8 +105,6 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
         A[s] = {c: d[c].reindex(dates).to_numpy(dtype=float) for c in ["Open", "High", "Low", "Close", "ATR", "MOM63"]}
         A[s]["Entry"] = d["Entry"].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
         A[s]["Exit"] = d["Exit"].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
-        A[s]["Allow"] = (allow[s].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
-                         if allow is not None and s in allow else np.ones(n, dtype=bool))
     if market_ok is not None:
         mk = market_ok.astype(float).reindex(dates).ffill().fillna(0).to_numpy() > 0.5
     else:
@@ -211,7 +203,7 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
             for s, a in A.items():
                 if s in positions or s in pending_entries:
                     continue
-                if a["Entry"][i] and a["Allow"][i] and a["ATR"][i] > 0:
+                if a["Entry"][i] and a["ATR"][i] > 0:
                     m = a["MOM63"][i]
                     cands.append((m if not np.isnan(m) else -1e9, s, a["ATR"][i]))
             cands.sort(reverse=True)
@@ -324,105 +316,6 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
                     if s not in target:
                         target.append(s)
                 pending_target = set(target)
-
-    open_pos = [{
-        "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
-        "Last close ₹": round(last_close.get(s, h["entry"]), 2),
-        "Open P/L (₹)": round(h["qty"] * (last_close.get(s, h["entry"]) - h["entry"]), 2),
-    } for s, h in holdings.items()]
-    return {"equity": pd.Series(eq_vals, index=dates[warmup:]), "trades": pd.DataFrame(trades),
-            "open": pd.DataFrame(open_pos), "blocked_days": 0}
-
-
-def momentum_top(data, k=10):
-    """Dates x symbols table: True when the stock is in the momentum top k that day
-    (above its 200-day average, positive 6-month return, ranked by 6-month return)."""
-    mom = pd.DataFrame({s: d["MOM126"] for s, d in data.items()})
-    ok = pd.DataFrame({s: d["Above200"] for s, d in data.items()}).reindex(mom.index).fillna(False).astype(bool)
-    m = mom.where(ok & (mom > 0))
-    return m.rank(axis=1, ascending=False, method="first") <= k
-
-
-def run_pullback(data, market_ok, capital, slots, cost_side, rsi_max=10, max_days=5, warmup=200, allow=None):
-    """Short-term pullback. With allow (dates x symbols, True = in momentum top 10) this is strategy E.
-    Buy at the next open when a stock is above its 200-day average and its 2-day RSI closes below rsi_max
-    (and Nifty 50 is above its 200-day average). Most oversold first if there are more signals than free slots.
-    Sell at the next open after the close rises above the 5-day average, or after max_days trading days."""
-    if not data:
-        return None
-    dates = pd.DatetimeIndex(sorted(set().union(*[set(d.index) for d in data.values()])))
-    n = len(dates)
-    if n < warmup + 30:
-        return None
-    A = {}
-    for s, d in data.items():
-        A[s] = {c: d[c].reindex(dates).to_numpy(dtype=float) for c in ["Open", "Close", "RSI2", "SMA5"]}
-        A[s]["Above200"] = d["Above200"].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
-        A[s]["Allow"] = (allow[s].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
-                         if allow is not None and s in allow else np.ones(n, dtype=bool))
-    mk = (market_ok.astype(float).reindex(dates).ffill().fillna(0).to_numpy() > 0.5) if market_ok is not None else np.ones(n, dtype=bool)
-
-    cash = float(capital)
-    holdings, last_close, trades, eq_vals = {}, {}, [], []
-    pending_buys, pending_sells = [], set()
-
-    for i in range(warmup, n):
-        day = dates[i]
-        # Sells at today's open
-        for s in list(pending_sells):
-            o = A[s]["Open"][i]
-            if s not in holdings:
-                pending_sells.discard(s)
-                continue
-            if np.isnan(o):
-                continue
-            h = holdings.pop(s)
-            exit_px = o * (1 - cost_side)
-            cash += h["qty"] * exit_px
-            trades.append({
-                "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
-                "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"], "Exit reason": h["why"],
-                "P/L (₹)": round(h["qty"] * (exit_px - h["entry"]), 2),
-                "Return %": round((exit_px / h["entry"] - 1) * 100, 2), "Days held": (day - h["entry_date"]).days,
-            })
-            pending_sells.discard(s)
-        # Buys at today's open (equal slots of current equity)
-        if pending_buys:
-            equity_open = cash + sum(h["qty"] * (A[s]["Open"][i] if not np.isnan(A[s]["Open"][i]) else last_close.get(s, h["entry"]))
-                                     for s, h in holdings.items())
-            slot_value = equity_open / slots
-            for s in pending_buys:
-                if s in holdings or len(holdings) >= slots:
-                    continue
-                o = A[s]["Open"][i]
-                if np.isnan(o):
-                    continue
-                entry_px = o * (1 + cost_side)
-                qty = int(min(slot_value, cash) // entry_px)
-                if qty < 1:
-                    continue
-                cash -= qty * entry_px
-                holdings[s] = {"qty": qty, "entry": entry_px, "entry_date": day, "days": 0, "why": ""}
-            pending_buys = []
-        # End of day: exits and new signals
-        for s, h in holdings.items():
-            c = A[s]["Close"][i]
-            if np.isnan(c):
-                continue
-            last_close[s] = c
-            h["days"] += 1
-            if c > A[s]["SMA5"][i]:
-                h["why"] = "Bounce (above 5-day avg)"
-                pending_sells.add(s)
-            elif h["days"] >= max_days:
-                h["why"] = f"Time exit ({max_days} days)"
-                pending_sells.add(s)
-        eq_vals.append(cash + sum(h["qty"] * last_close.get(s, h["entry"]) for s, h in holdings.items()))
-        free = slots - (len(holdings) - len(pending_sells & set(holdings)))
-        if mk[i] and free > 0 and i < n - 1:
-            cands = sorted((A[s]["RSI2"][i], s) for s in A
-                           if s not in holdings and A[s]["Above200"][i] and A[s]["Allow"][i] and A[s]["RSI2"][i] < rsi_max)
-            pending_buys = [s for _, s in cands[:free]]
 
     open_pos = [{
         "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
@@ -1085,12 +978,9 @@ def page_scanner():
 
 
 # ================================== BACKTEST ==================================
-STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum",
-          "E. Momentum + pullback", "F. Momentum + breakout"]
-SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum",
-         STRATS[3]: "E. Mom+Pullback", STRATS[4]: "F. Mom+Breakout"}
-LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, STRATS[3]: "#F59E0B",
-               STRATS[4]: "#8B5CF6", "Nifty 50 buy & hold": NAVY}
+STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum"}
+LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, "Nifty 50 buy & hold": NAVY}
 
 
 def show_details(result, cap, nifty):
@@ -1130,9 +1020,7 @@ def show_details(result, cap, nifty):
 
 
 def page_backtest():
-    st.caption("New (swing, only in momentum top-10 stocks): E buys after a sharp 2-3 day fall (2-day RSI below 10) "
-               "and sells on the bounce or after 5 days; F buys a 20-day-high breakout with a trailing stop.")
-    st.caption("Runs A, B, C, E and F on the whole stock list with your money rules and costs, "
+    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, "
                "and compares them with simply holding Nifty 50.")
     period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
     period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[period_label]
@@ -1145,12 +1033,6 @@ def page_backtest():
                                         exit_mode="trail", trail_mult=trail_mult),
                 STRATS[2]: run_momentum(data, mk, capital, top_n, cost_side),
             }
-            top10 = momentum_top(data, 10)
-            results.update({
-                STRATS[3]: run_pullback(data, mk, capital, top_n, cost_side, allow=top10),
-                STRATS[4]: run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side,
-                                        exit_mode="trail", trail_mult=trail_mult, allow=top10),
-            })
         st.session_state.bt = {"results": results, "nifty": nifty, "failed": failed, "capital": capital}
     bt = st.session_state.get("bt")
     if not (bt and "results" in bt):
