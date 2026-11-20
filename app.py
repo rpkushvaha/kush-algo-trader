@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
+import json, zlib, base64
 
 try:
     import yfinance as yf
@@ -436,6 +437,30 @@ DEFAULTS = {
     "breakout_days": 20, "atr_mult": 2.0, "rr": 2.0, "trail_mult": 3.0,
     "cost_pct": 0.15, "slip_pct": 0.05, "symbols_text": DEFAULT_SYMBOLS, "nav": "Home",
 }
+
+
+def _enc(obj):
+    raw = json.dumps(obj, separators=(",", ":"), default=lambda o: o.item() if hasattr(o, "item") else str(o))
+    return base64.urlsafe_b64encode(zlib.compress(raw.encode("utf-8"), 9)).decode("ascii")
+
+
+def _dec(text):
+    return json.loads(zlib.decompress(base64.urlsafe_b64decode(text.encode("ascii"))).decode("utf-8"))
+
+
+SAVE_KEYS = [k for k in DEFAULTS if k != "nav"]
+if not st.session_state.get("_restored"):
+    st.session_state["_restored"] = True
+    try:
+        saved = _dec(st.query_params.get("s", "")) if st.query_params.get("s") else {}
+        for k, v in saved.get("set", {}).items():
+            if k in SAVE_KEYS:
+                st.session_state[k] = v
+        if isinstance(saved.get("p"), list):
+            st.session_state["paper"] = saved["p"]
+    except Exception:
+        pass
+
 for _k, _v in DEFAULTS.items():
     st.session_state[_k] = st.session_state.get(_k, _v)
 
@@ -466,8 +491,8 @@ st.markdown(f"""
 html, body, .stApp, .stMarkdown, button, input, textarea, select {{ font-family:'Inter', sans-serif; }}
 .stApp {{ background:#F6F7FB; }}
 #MainMenu, footer {{ visibility:hidden; }}
-header[data-testid="stHeader"] {{ background:transparent; }}
-.block-container {{ padding-top:1.2rem; padding-bottom:4rem; max-width:760px; }}
+header[data-testid="stHeader"] {{ background:#F6F7FB; }}
+.block-container {{ padding-top:3.6rem; padding-bottom:4rem; max-width:760px; }}
 .ms {{ font-family:'Material Symbols Rounded'; font-weight:normal; font-style:normal; line-height:1;
        letter-spacing:normal; text-transform:none; display:inline-block; white-space:nowrap;
        -webkit-font-feature-settings:'liga'; font-feature-settings:'liga'; vertical-align:middle; }}
@@ -489,7 +514,8 @@ header[data-testid="stHeader"] {{ background:transparent; }}
 @media (min-width: 640px) {{ .st-key-nav div[role="radiogroup"] {{ grid-template-columns:repeat(6, 1fr); }} }}
 .st-key-nav label {{ margin:0 !important; padding:8px 4px; border-radius:10px; border:1.5px solid transparent;
     justify-content:center; cursor:pointer; }}
-.st-key-nav label > div:first-child {{ display:none; }}
+.st-key-nav label > div:not(:has(p)) {{ display:none !important; }}
+.st-key-nav label > div:has(p) {{ width:100%; display:flex; justify-content:center; padding:0 !important; margin:0 !important; }}
 .st-key-nav label p {{ font-size:13.5px; color:#475569; font-weight:500; }}
 .st-key-nav label:has(input:checked) {{ background:#fff; border-color:var(--acc); box-shadow:0 1px 3px rgba(15,23,42,.08); }}
 .st-key-nav label:has(input:checked) p {{ color:var(--acc); font-weight:700; }}
@@ -506,6 +532,16 @@ header[data-testid="stHeader"] {{ background:transparent; }}
 /* Section title */
 .kt-sec {{ display:flex; align-items:center; gap:8px; font-size:16px; font-weight:700; color:#0F172A; margin:18px 0 8px; }}
 .kt-sec .ms {{ color:var(--acc); font-size:22px; }}
+
+/* Buy / sell boxes */
+.kt-act {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0 12px; }}
+.kt-box {{ background:#fff; border:1px solid var(--line); border-radius:16px; padding:12px 14px; }}
+.kt-box .kt-lab {{ font-weight:600; }}
+.kt-box.sell .kt-lab .ms {{ color:var(--bad); }}
+.kt-chip {{ display:inline-block; margin:6px 6px 0 0; padding:4px 10px; border-radius:999px; font-size:12.5px;
+           font-weight:600; background:#E7F6F0; color:#065F46; }}
+.kt-box.sell .kt-chip {{ background:#FEE2E2; color:#991B1B; }}
+.kt-none {{ font-size:13px; color:#94A3B8; margin-top:6px; }}
 
 /* Status banner */
 .kt-status {{ display:flex; gap:10px; align-items:center; padding:12px 14px; border-radius:14px; margin:4px 0 10px;
@@ -545,8 +581,8 @@ def money(x, signed=False):
     if x is None or (isinstance(x, float) and np.isnan(x)):
         return "—"
     s = f"₹{abs(x):,.0f}"
-    if signed:
-        return ("+" if x >= 0 else "−") + s
+    if signed and round(x) != 0:
+        return ("+" if x > 0 else "−") + s
     return ("−" if x < 0 else "") + s
 
 
@@ -646,11 +682,12 @@ def picks_html(df):
     rows = ""
     for _, r in df.iterrows():
         ch = r["6M return %"]
-        amt = money(capital / top_n)
+        qty = int((capital / top_n) // r["Close ₹"]) if r["Close ₹"] else 0
+        buy = f"{qty} sh · {money(qty * r['Close ₹'])}" if qty else "too costly for one slot"
         rows += (f'<div class="kt-row"><div class="kt-rank">{int(r["Rank"])}</div>'
-                 f'<div><div class="kt-sym">{r["Symbol"]}</div><div class="kt-meta">Close ₹{r["Close ₹"]:,.2f}</div></div>'
+                 f'<div><div class="kt-sym">{r["Symbol"]}</div><div class="kt-meta">₹{r["Close ₹"]:,.2f} · {buy}</div></div>'
                  f'<div class="kt-right"><div class="kt-chg {tone(ch)}">{ch:+.1f}%</div>'
-                 f'<div class="kt-meta">6 months · {amt}</div></div></div>')
+                 f'<div class="kt-meta">6 months</div></div></div>')
     return f'<div class="kt-list">{rows}</div>'
 
 
@@ -658,7 +695,7 @@ def picks_html(df):
 st.markdown("""
 <div class="kt-hero">
   <div class="kt-logo">K</div>
-  <div><div class="kt-title">Kush Algo Trader</div><div class="kt-sub">Momentum strategy · Paper trading</div></div>
+  <div><div class="kt-title">Kush Algo Trader</div><div class="kt-sub">Momentum · Paper trading</div></div>
   <div class="kt-badge">PAPER</div>
 </div>
 """, unsafe_allow_html=True)
@@ -698,33 +735,51 @@ def page_home():
     ])
 
     picks = momentum_picks(data, mk_now, top_n)
-    section("workspace_premium", f"This month's top {top_n}")
+    now = datetime.now(IST)
+    month_end = last_weekday(today.year, today.month)
+    in_window = (today == month_end) or (today.day <= 3 and today.weekday() < 5)
+    if today == month_end:
+        title, note = f"Top {top_n} for this rebalance", (
+            "List is final after 3:30 pm today." if now.hour * 60 + now.minute < 930 else "Final list for this month.")
+    elif in_window:
+        title, note = f"Top {top_n} for this rebalance", "Month-end rebalance window is open."
+    else:
+        title, note = f"Current top {top_n}", (
+            f"This list can still change. The final list comes after 3:30 pm on {reb.strftime('%a, %d %b')}.")
+    section("workspace_premium", title)
+    st.caption(note)
     if picks is None or picks.empty:
         st.info("No data for picks.")
         return
     chosen = picks[picks["Pick"] != ""]
     if chosen.empty:
         status("bad", "block", "No stock qualifies right now (market filter or no stock in an uptrend). Stay in cash.")
+        return
+    st.markdown(picks_html(chosen), unsafe_allow_html=True)
+    st.caption(f"Slot size about {money(capital / top_n)} (capital ÷ {top_n}).")
+
+    # What the paper portfolio should change on rebalance day
+    open_c = [t for t in st.session_state.paper if t["Status"] == "Open" and t.get("Strategy") == "C"]
+    keep_zone = set(picks.loc[picks["Rank"].notna() & (picks["Rank"].fillna(999).astype(int) <= 2 * top_n), "Symbol"])
+    to_sell = [t["Symbol"] for t in open_c if (not mk_now) or t["Symbol"] not in keep_zone]
+    held = {t["Symbol"] for t in open_c}
+    free_slots = max(0, top_n - (len(held) - len(set(to_sell))))
+    to_buy = [s for s in chosen["Symbol"] if s not in held][:free_slots]
+
+    def box(kind, icon, label, items):
+        inner = "".join(f'<span class="kt-chip">{x}</span>' for x in items) or '<div class="kt-none">Nothing</div>'
+        return (f'<div class="kt-box {kind}"><div class="kt-lab"><span class="ms">{icon}</span>{label}</div>{inner}</div>')
+
+    section("swap_horiz", "Rebalance plan" if in_window else f"Plan for {reb.strftime('%d %b')} (preview)")
+    st.markdown('<div class="kt-act">' + box("sell", "remove_shopping_cart", "Sell", to_sell)
+                + box("buy", "add_shopping_cart", "Buy", to_buy) + '</div>', unsafe_allow_html=True)
+
+    if not in_window:
+        status("info", "schedule", f"Recording opens on <b>{reb.strftime('%a, %d %b')}</b>. Buying now would use "
+               "today's prices, not the month-end prices the strategy was tested on.")
     else:
-        st.markdown(picks_html(chosen), unsafe_allow_html=True)
-        st.caption(f"About {money(capital / top_n)} in each. Act only on rebalance day "
-                   "(last trading day of the month; one day earlier if it is a market holiday).")
-
-        # What the paper portfolio should change on rebalance day
-        open_c = [t for t in st.session_state.paper if t["Status"] == "Open" and t.get("Strategy") == "C"]
-        keep_zone = set(picks.loc[picks["Rank"].notna() & (picks["Rank"].fillna(999).astype(int) <= 2 * top_n), "Symbol"])
-        to_sell = [t["Symbol"] for t in open_c if (not mk_now) or t["Symbol"] not in keep_zone]
-        held = {t["Symbol"] for t in open_c}
-        to_buy = [s for s in chosen["Symbol"] if s not in held]
-        free_slots = max(0, top_n - (len(held) - len(set(to_sell))))
-        to_buy = to_buy[:free_slots]
-
-        if open_c or to_buy:
-            section("swap_horiz", "On rebalance day")
-            c1, c2 = st.columns(2)
-            c1.markdown("**Sell**<br>" + (", ".join(to_sell) if to_sell else "Nothing"), unsafe_allow_html=True)
-            c2.markdown("**Buy**<br>" + (", ".join(to_buy) if to_buy else "Nothing"), unsafe_allow_html=True)
-
+        st.caption("Tip: after 3:30 pm, place these as AMO (after-market) orders in Zerodha; they fill at the next "
+                   "morning's open, the same way the backtest assumed.")
         if to_buy and st.button(f"Record {len(to_buy)} buy(s) as paper trades", type="primary", width="stretch",
                                 icon=":material/add_task:"):
             added = 0
@@ -738,7 +793,7 @@ def page_home():
             st.toast(f"{added} paper trade(s) recorded")
             st.rerun()
         if to_sell:
-            st.caption("Close the 'Sell' stocks in the Paper page with their exit price.")
+            st.caption("Close the 'Sell' stocks on the Paper page first.")
     if failed:
         st.caption("Could not load: " + ", ".join(failed))
 
@@ -955,7 +1010,8 @@ def page_paper():
             st.dataframe(pd.DataFrame(closed), width="stretch", hide_index=True)
 
     section("save", "Save your log")
-    st.caption("The log lives in this browser session. Download it after each change and load it back next time.")
+    st.caption("Your log and settings are kept in this page's web address. Open the app from the same browser tab "
+               "(or bookmark it after a change). Keep a CSV backup too.")
     if paper:
         st.download_button("Download paper log", pd.DataFrame(paper).to_csv(index=False).encode("utf-8"),
                            file_name="kush_paper_trades.csv", mime="text/csv", width="stretch", icon=":material/download:")
@@ -1076,3 +1132,15 @@ PAGES = {"Home": page_home, "Scanner": page_scanner, "Backtest": page_backtest,
          "Paper": page_paper, "Stock": page_stock, "Settings": page_settings}
 PAGES[page]()
 footer()
+
+try:
+    _state = {"set": {k: st.session_state[k] for k in SAVE_KEYS if st.session_state[k] != DEFAULTS[k]},
+              "p": st.session_state.paper}
+    if _state["set"] or _state["p"]:
+        _code = _enc(_state)
+        if st.query_params.get("s") != _code:
+            st.query_params["s"] = _code
+    elif "s" in st.query_params:
+        del st.query_params["s"]
+except Exception:
+    pass
