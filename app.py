@@ -12,7 +12,7 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
-APP_VERSION = "1.5"
+APP_VERSION = "1.6"
 APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
@@ -79,12 +79,6 @@ def add_indicators(df, breakout_days):
     d["Breakout"] = d["Close"] > d["HH"]
     d["Entry"] = d["Trend_OK"] & d["Breakout"] & d["ATR"].notna()
     d["Exit"] = d["Close"] < d["EMA50"]
-    # Short-term pullback (strategy D): 2-day RSI (Wilder) and 5-day average
-    delta = d["Close"].diff()
-    up = delta.clip(lower=0).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
-    dn = (-delta.clip(upper=0)).ewm(alpha=1 / 2, adjust=False, min_periods=2).mean()
-    d["RSI2"] = (100 - 100 / (1 + up / dn.replace(0, np.nan))).fillna(100)
-    d["SMA5"] = d["Close"].rolling(5).mean()
     return d
 
 
@@ -322,94 +316,6 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
                     if s not in target:
                         target.append(s)
                 pending_target = set(target)
-
-    open_pos = [{
-        "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
-        "Last close ₹": round(last_close.get(s, h["entry"]), 2),
-        "Open P/L (₹)": round(h["qty"] * (last_close.get(s, h["entry"]) - h["entry"]), 2),
-    } for s, h in holdings.items()]
-    return {"equity": pd.Series(eq_vals, index=dates[warmup:]), "trades": pd.DataFrame(trades),
-            "open": pd.DataFrame(open_pos), "blocked_days": 0}
-
-
-def run_pullback(data, market_ok, capital, slots, cost_side, rsi_max=10, max_days=5, warmup=200):
-    """Short-term pullback (strategy D).
-    Buy at the next open when a stock is above its 200-day average and its 2-day RSI closes below rsi_max
-    (and Nifty 50 is above its 200-day average). Most oversold first if there are more signals than free slots.
-    Sell at the next open after the close rises above the 5-day average, or after max_days trading days."""
-    if not data:
-        return None
-    dates = pd.DatetimeIndex(sorted(set().union(*[set(d.index) for d in data.values()])))
-    n = len(dates)
-    if n < warmup + 30:
-        return None
-    A = {}
-    for s, d in data.items():
-        A[s] = {c: d[c].reindex(dates).to_numpy(dtype=float) for c in ["Open", "Close", "RSI2", "SMA5"]}
-        A[s]["Above200"] = d["Above200"].astype(float).reindex(dates).fillna(0).to_numpy() > 0.5
-    mk = (market_ok.astype(float).reindex(dates).ffill().fillna(0).to_numpy() > 0.5) if market_ok is not None else np.ones(n, dtype=bool)
-
-    cash = float(capital)
-    holdings, last_close, trades, eq_vals = {}, {}, [], []
-    pending_buys, pending_sells = [], set()
-
-    for i in range(warmup, n):
-        day = dates[i]
-        # Sells at today's open
-        for s in list(pending_sells):
-            o = A[s]["Open"][i]
-            if s not in holdings:
-                pending_sells.discard(s)
-                continue
-            if np.isnan(o):
-                continue
-            h = holdings.pop(s)
-            exit_px = o * (1 - cost_side)
-            cash += h["qty"] * exit_px
-            trades.append({
-                "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
-                "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"], "Exit reason": h["why"],
-                "P/L (₹)": round(h["qty"] * (exit_px - h["entry"]), 2),
-                "Return %": round((exit_px / h["entry"] - 1) * 100, 2), "Days held": (day - h["entry_date"]).days,
-            })
-            pending_sells.discard(s)
-        # Buys at today's open (equal slots of current equity)
-        if pending_buys:
-            equity_open = cash + sum(h["qty"] * (A[s]["Open"][i] if not np.isnan(A[s]["Open"][i]) else last_close.get(s, h["entry"]))
-                                     for s, h in holdings.items())
-            slot_value = equity_open / slots
-            for s in pending_buys:
-                if s in holdings or len(holdings) >= slots:
-                    continue
-                o = A[s]["Open"][i]
-                if np.isnan(o):
-                    continue
-                entry_px = o * (1 + cost_side)
-                qty = int(min(slot_value, cash) // entry_px)
-                if qty < 1:
-                    continue
-                cash -= qty * entry_px
-                holdings[s] = {"qty": qty, "entry": entry_px, "entry_date": day, "days": 0, "why": ""}
-            pending_buys = []
-        # End of day: exits and new signals
-        for s, h in holdings.items():
-            c = A[s]["Close"][i]
-            if np.isnan(c):
-                continue
-            last_close[s] = c
-            h["days"] += 1
-            if c > A[s]["SMA5"][i]:
-                h["why"] = "Bounce (above 5-day avg)"
-                pending_sells.add(s)
-            elif h["days"] >= max_days:
-                h["why"] = f"Time exit ({max_days} days)"
-                pending_sells.add(s)
-        eq_vals.append(cash + sum(h["qty"] * last_close.get(s, h["entry"]) for s, h in holdings.items()))
-        free = slots - (len(holdings) - len(pending_sells & set(holdings)))
-        if mk[i] and free > 0 and i < n - 1:
-            cands = sorted((A[s]["RSI2"][i], s) for s in A
-                           if s not in holdings and A[s]["Above200"][i] and A[s]["RSI2"][i] < rsi_max)
-            pending_buys = [s for _, s in cands[:free]]
 
     open_pos = [{
         "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
@@ -723,6 +629,21 @@ def price_chart(frame, colors, height=300):
                                   legend=alt.Legend(orient="bottom", title=None)),
                   tooltip=["Date:T", "Line:N", alt.Tooltip("₹:Q", format=",.2f")])
           .properties(height=height))
+    st.altair_chart(ch, width="stretch")
+
+
+def pl_chart(series):
+    """Horizontal bars per stock: green for profit, red for loss (fits a phone screen)."""
+    import altair as alt
+    df = series.sort_values(ascending=False).rename("P/L").reset_index()
+    df.columns = ["Stock", "P/L"]
+    df["Result"] = np.where(df["P/L"] >= 0, "Profit", "Loss")
+    ch = (alt.Chart(df).mark_bar(cornerRadius=2)
+          .encode(y=alt.Y("Stock:N", sort=list(df["Stock"]), title=None),
+                  x=alt.X("P/L:Q", title="₹", scale=alt.Scale(zero=True)),
+                  color=alt.Color("Result:N", scale=alt.Scale(domain=["Profit", "Loss"], range=[GOOD, BAD]), legend=None),
+                  tooltip=["Stock:N", alt.Tooltip("P/L:Q", format=",.0f")])
+          .properties(height=max(160, 18 * len(df))))
     st.altair_chart(ch, width="stretch")
 
 
@@ -1057,10 +978,9 @@ def page_scanner():
 
 
 # ================================== BACKTEST ==================================
-STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum", "D. Short-term pullback"]
-SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum", STRATS[3]: "D. Pullback"}
-LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, STRATS[3]: "#F59E0B",
-               "Nifty 50 buy & hold": NAVY}
+STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum"}
+LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, "Nifty 50 buy & hold": NAVY}
 
 
 def show_details(result, cap, nifty):
@@ -1087,7 +1007,7 @@ def show_details(result, cap, nifty):
         st.dataframe(trades["Exit reason"].value_counts().rename_axis("Reason").reset_index(name="Trades"),
                      width="stretch", hide_index=True)
         section("bar_chart", "Profit / loss by stock")
-        st.bar_chart(trades.groupby("Symbol")["P/L (₹)"].sum().sort_values(), height=300, color=ACC)
+        pl_chart(trades.groupby("Symbol")["P/L (₹)"].sum())
         with st.expander(f"All {s['n']} trades"):
             st.dataframe(trades, width="stretch", hide_index=True)
             st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8"),
@@ -1100,9 +1020,7 @@ def show_details(result, cap, nifty):
 
 
 def page_backtest():
-    st.caption("D (new, 2-5 day trades): buy a stock in a long uptrend after a sharp 2-3 day fall (2-day RSI below 10); "
-               "sell when it closes back above its 5-day average, or after 5 days.")
-    st.caption("Runs A, B, C and D on the whole stock list with your money rules and costs, "
+    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, "
                "and compares them with simply holding Nifty 50.")
     period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
     period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[period_label]
@@ -1114,7 +1032,6 @@ def page_backtest():
                 STRATS[1]: run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side,
                                         exit_mode="trail", trail_mult=trail_mult),
                 STRATS[2]: run_momentum(data, mk, capital, top_n, cost_side),
-                STRATS[3]: run_pullback(data, mk, capital, top_n, cost_side),
             }
         st.session_state.bt = {"results": results, "nifty": nifty, "failed": failed, "capital": capital}
     bt = st.session_state.get("bt")
