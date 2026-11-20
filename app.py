@@ -492,7 +492,7 @@ html, body, .stApp, .stMarkdown, button, input, textarea, select {{ font-family:
 .stApp {{ background:#F6F7FB; }}
 #MainMenu, footer {{ visibility:hidden; }}
 header[data-testid="stHeader"] {{ background:#F6F7FB; }}
-.block-container {{ padding-top:3.6rem; padding-bottom:4rem; max-width:760px; }}
+.block-container {{ padding-top:3.2rem; padding-bottom:4rem; max-width:760px; }}
 .ms {{ font-family:'Material Symbols Rounded'; font-weight:normal; font-style:normal; line-height:1;
        letter-spacing:normal; text-transform:none; display:inline-block; white-space:nowrap;
        -webkit-font-feature-settings:'liga'; font-feature-settings:'liga'; vertical-align:middle; }}
@@ -508,17 +508,18 @@ header[data-testid="stHeader"] {{ background:#F6F7FB; }}
 .kt-badge {{ margin-left:auto; font-size:11px; font-weight:700; letter-spacing:.8px; color:#0B1F3A;
             background:#D1FAE5; padding:4px 9px; border-radius:999px; }}
 
-/* Navigation strip: grey strip, chosen = white pill with accent edge. Wraps, never slides sideways. */
-.st-key-nav div[role="radiogroup"] {{ display:grid; grid-template-columns:repeat(3, 1fr); gap:4px;
-    background:#ECEFF4; border-radius:14px; padding:4px; width:100%; }}
-@media (min-width: 640px) {{ .st-key-nav div[role="radiogroup"] {{ grid-template-columns:repeat(6, 1fr); }} }}
-.st-key-nav label {{ margin:0 !important; padding:8px 4px; border-radius:10px; border:1.5px solid transparent;
-    justify-content:center; cursor:pointer; }}
-.st-key-nav label > div:not(:has(p)) {{ display:none !important; }}
-.st-key-nav label > div:has(p) {{ width:100%; display:flex; justify-content:center; padding:0 !important; margin:0 !important; }}
-.st-key-nav label p {{ font-size:13.5px; color:#475569; font-weight:500; }}
-.st-key-nav label:has(input:checked) {{ background:#fff; border-color:var(--acc); box-shadow:0 1px 3px rgba(15,23,42,.08); }}
-.st-key-nav label:has(input:checked) p {{ color:var(--acc); font-weight:700; }}
+/* Navigation: pill buttons in a grey strip, 3 per row on phones, never sliding sideways */
+.st-key-nav {{ background:#ECEFF4; border-radius:14px; padding:5px; }}
+.st-key-nav [data-testid="stButtonGroup"], .st-key-nav div[role="group"] {{ display:grid !important;
+    grid-template-columns:repeat(3, 1fr); gap:5px; width:100%; }}
+@media (min-width: 640px) {{ .st-key-nav [data-testid="stButtonGroup"], .st-key-nav div[role="group"] {{
+    grid-template-columns:repeat(6, 1fr); }} }}
+.st-key-nav button {{ width:100%; margin:0 !important; justify-content:center; border-radius:10px !important;
+    background:transparent; border:1.5px solid transparent; color:#475569; min-height:40px; }}
+.st-key-nav button p {{ font-size:13.5px; font-weight:500; }}
+.st-key-nav button[kind$="Active"], .st-key-nav button[data-testid$="Active"] {{ background:#fff !important;
+    border-color:var(--acc) !important; color:var(--acc) !important; box-shadow:0 1px 3px rgba(15,23,42,.08); }}
+.st-key-nav button[kind$="Active"] p, .st-key-nav button[data-testid$="Active"] p {{ font-weight:700; color:var(--acc); }}
 
 /* Tiles */
 .kt-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0 14px; }}
@@ -605,6 +606,25 @@ def tiles(items):
         html += (f'<div class="kt-tile"><div class="kt-lab"><span class="ms">{icon}</span>{label}</div>'
                  f'<div class="kt-val {tn}">{value}</div><div class="kt-subt">{sub}</div></div>')
     st.markdown(f'<div class="kt-grid">{html}</div>', unsafe_allow_html=True)
+
+
+def price_chart(frame, colors, height=300):
+    import altair as alt
+    long = frame.reset_index().rename(columns={frame.index.name or "index": "Date"})
+    long = long.rename(columns={long.columns[0]: "Date"}).melt("Date", var_name="Line", value_name="₹")
+    ch = (alt.Chart(long).mark_line(strokeWidth=1.8)
+          .encode(x=alt.X("Date:T", title=None),
+                  y=alt.Y("₹:Q", title=None, scale=alt.Scale(zero=False)),
+                  color=alt.Color("Line:N", scale=alt.Scale(domain=list(frame.columns), range=colors),
+                                  legend=alt.Legend(orient="bottom", title=None)),
+                  tooltip=["Date:T", "Line:N", alt.Tooltip("₹:Q", format=",.2f")])
+          .properties(height=height))
+    st.altair_chart(ch, width="stretch")
+
+
+def data_date(data):
+    dates = [d.index[-1] for d in data.values() if not d.empty]
+    return max(dates).date() if dates else None
 
 
 def footer():
@@ -704,9 +724,19 @@ NAV = ["Home", "Scanner", "Backtest", "Paper", "Stock", "Settings"]
 NAV_ICON = {"Home": ":material/home:", "Scanner": ":material/radar:", "Backtest": ":material/query_stats:",
             "Paper": ":material/receipt_long:", "Stock": ":material/candlestick_chart:", "Settings": ":material/tune:"}
 if st.session_state.nav not in NAV:
-    st.session_state.nav = "Home"
-page = st.radio("Navigation", NAV, key="nav", horizontal=True, label_visibility="collapsed",
-                format_func=lambda x: f"{NAV_ICON[x]} {x}")
+    st.session_state.nav = st.session_state.get("_last_nav", "Home")
+
+
+def _keep_nav():
+    # Tapping the selected tab again would un-select it; keep the last page instead.
+    if st.session_state.nav is None:
+        st.session_state.nav = st.session_state.get("_last_nav", "Home")
+
+
+st.pills("Navigation", NAV, key="nav", selection_mode="single", label_visibility="collapsed",
+         format_func=lambda x: f"{NAV_ICON[x]} {x}", on_change=_keep_nav)
+page = st.session_state.nav or st.session_state.get("_last_nav", "Home")
+st.session_state["_last_nav"] = page
 
 
 # =================================== HOME ===================================
@@ -734,6 +764,9 @@ def page_home():
         ("savings", "Booked P/L", money(ps["realized"], signed=True), "closed paper trades", tone(ps["realized"])),
     ])
 
+    dd = data_date(data)
+    if dd:
+        st.caption(f"Prices as of close on {dd.strftime('%a, %d %b %Y')}")
     picks = momentum_picks(data, mk_now, top_n)
     now = datetime.now(IST)
     month_end = last_weekday(today.year, today.month)
@@ -774,10 +807,15 @@ def page_home():
     st.markdown('<div class="kt-act">' + box("sell", "remove_shopping_cart", "Sell", to_sell)
                 + box("buy", "add_shopping_cart", "Buy", to_buy) + '</div>', unsafe_allow_html=True)
 
-    if not in_window:
+    prices_ready = not (today == month_end and (dd is None or dd < today))
+    if in_window and not prices_ready:
+        status("bad", "hourglass_top", f"Today's closing prices are not in yet (latest: "
+               f"{dd.strftime('%d %b') if dd else 'none'}). Yahoo usually adds them by the evening. "
+               "Tap Refresh on the Scanner page later, then record.")
+    elif not in_window:
         status("info", "schedule", f"Recording opens on <b>{reb.strftime('%a, %d %b')}</b>. Buying now would use "
                "today's prices, not the month-end prices the strategy was tested on.")
-    else:
+    if in_window and prices_ready:
         st.caption("Tip: after 3:30 pm, place these as AMO (after-market) orders in Zerodha; they fill at the next "
                    "morning's open, the same way the backtest assumed.")
         if to_buy and st.button(f"Record {len(to_buy)} buy(s) as paper trades", type="primary", width="stretch",
@@ -818,7 +856,17 @@ def page_scanner():
                f"keep an old holding while it ranks {2 * top_n} or better.")
     mom = momentum_picks(data, mk_now, top_n)
     if mom is not None and not mom.empty:
-        st.dataframe(mom.head(max(2 * top_n, 10)), width="stretch", hide_index=True)
+        ranked = mom[mom["Rank"].notna()].head(2 * top_n)
+        rows = ""
+        for _, r in ranked.iterrows():
+            rk = int(r["Rank"])
+            tag = ('<span class="kt-chip">Hold</span>' if rk <= top_n and r["Pick"]
+                   else '<span class="kt-chip" style="background:#F1F5F9;color:#475569">Keep zone</span>')
+            rows += (f'<div class="kt-row"><div class="kt-rank">{rk}</div>'
+                     f'<div><div class="kt-sym">{r["Symbol"]}</div><div class="kt-meta">₹{r["Close ₹"]:,.2f}</div></div>'
+                     f'<div class="kt-right"><div class="kt-chg {tone(r["6M return %"])}">{r["6M return %"]:+.1f}%</div>'
+                     f'{tag}</div></div>')
+        st.markdown(f'<div class="kt-list">{rows}</div>', unsafe_allow_html=True)
         with st.expander("Full ranking"):
             st.dataframe(mom, width="stretch", hide_index=True)
 
@@ -1044,9 +1092,8 @@ def page_paper():
 
 # =================================== STOCK ===================================
 def page_stock():
-    c1, c2 = st.columns([2, 1])
-    sym_in = c1.text_input("NSE symbol", "TCS")
-    sym_period_label = c2.selectbox("Period", ["2 years", "5 years", "10 years"], index=1)
+    sym_in = st.text_input("NSE symbol", "TCS")
+    sym_period_label = st.session_state.get("stock_period", "5 years")
     sym_period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[sym_period_label]
     one = parse_symbols(sym_in)[:1]
     if not one:
@@ -1064,9 +1111,11 @@ def page_stock():
         ("payments", "Last close", f"₹{last['Close']:,.2f}", str(d.index[-1].date()), ""),
         ("trending_up", "6-month return", f"{m6:+.1f}%" if m6 is not None else "—", trend, tone(m6 or 0)),
     ])
-    st.line_chart(d[["Close", "EMA20", "EMA50", "SMA200"]].tail(250), height=300,
-                  color=[NAVY, "#F59E0B", "#3B82F6", ACC])
+    section("show_chart", "Last 12 months")
+    price_chart(d[["Close", "EMA20", "EMA50", "SMA200"]].tail(250), [NAVY, "#F59E0B", "#3B82F6", ACC])
     with st.expander("Breakout backtest on this stock (A / B)"):
+        st.selectbox("Backtest period", ["2 years", "5 years", "10 years"], key="stock_period",
+                     index=["2 years", "5 years", "10 years"].index(sym_period_label))
         style = st.radio("Exit style", ["Fixed target (A)", "Trailing stop (B)"], horizontal=True)
         r1 = run_backtest(data1, mk1, capital, risk, 1, daily_limit, atr_mult, rr, cost_side,
                           exit_mode="target" if style.startswith("Fixed") else "trail", trail_mult=trail_mult)
