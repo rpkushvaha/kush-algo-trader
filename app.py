@@ -422,45 +422,158 @@ def fetch_many(yf_symbols, period):
 
 # ================================== UI ==================================
 
-st.set_page_config(page_title="Kush Algo Trader V4", page_icon="📈", layout="wide")
-st.title("📈 Kush Algo Trader — Version 4")
-st.caption("Swing trading research • Nifty 50 scanner • Portfolio backtest • Paper trades • No live broker orders")
-st.warning(
-    "PAPER / RESEARCH ONLY. Prices come from Yahoo Finance (unofficial, may be delayed or incomplete). "
-    "Past results do not guarantee future results. This app is not connected to Zerodha and cannot place real orders."
-)
+st.set_page_config(page_title="Kush Algo Trader", page_icon="📈", layout="centered",
+                   initial_sidebar_state="collapsed")
 
 if not YF_AVAILABLE:
     st.error("yfinance is not installed. Add `yfinance` to requirements.txt and redeploy.")
     st.stop()
 
-with st.sidebar:
-    st.header("Money rules")
-    capital = st.number_input("Capital (₹)", min_value=10000, max_value=10000000, value=50000, step=5000)
-    risk = st.number_input("Risk per trade (₹)", min_value=100, max_value=100000, value=500, step=100,
-                           help="Maximum planned loss if the stop-loss is hit.")
-    max_pos = int(st.number_input("Max open trades", min_value=1, max_value=10, value=3))
-    daily_limit = st.number_input("Max loss per day (₹)", min_value=100, max_value=1000000, value=1000, step=100,
-                                  help="If losses in a day reach this, no new trade is taken the next day.")
-    st.divider()
-    st.header("Strategy")
-    breakout_days = int(st.number_input("Breakout lookback (days)", min_value=10, max_value=100, value=20))
-    atr_mult = st.slider("Stop-loss distance (× ATR)", 1.0, 4.0, 2.0, 0.5)
-    rr = st.slider("Target (× risk), fixed-target style", 1.0, 4.0, 2.0, 0.5)
-    trail_mult = st.slider("Trailing stop distance (× ATR), trailing style", 2.0, 6.0, 3.0, 0.5)
-    top_n = int(st.number_input("Momentum: number of stocks to hold", min_value=3, max_value=15, value=5))
-    use_mf = st.checkbox("Trade only when Nifty 50 is above its 200-day average", value=True)
-    st.divider()
-    st.header("Costs")
-    cost_pct = st.number_input("Trading cost per side (%)", min_value=0.0, max_value=1.0, value=0.15, step=0.01,
-                               help="Rough estimate for delivery trades: STT, stamp duty, exchange, GST, DP charges.")
-    slip_pct = st.number_input("Slippage per side (%)", min_value=0.0, max_value=1.0, value=0.05, step=0.01)
-    with st.expander("Stock list (Nifty 50)"):
-        symbols_text = st.text_area("NSE symbols, comma separated", DEFAULT_SYMBOLS, height=220)
-        st.caption("Check the latest list on niftyindices.com. Symbols that fail to load are skipped.")
+# ---------- Settings kept in session (survive page switches) ----------
+DEFAULTS = {
+    "capital": 50000, "risk": 500, "max_pos": 3, "daily_limit": 1000,
+    "top_n": 5, "use_mf": True,
+    "breakout_days": 20, "atr_mult": 2.0, "rr": 2.0, "trail_mult": 3.0,
+    "cost_pct": 0.15, "slip_pct": 0.05, "symbols_text": DEFAULT_SYMBOLS, "nav": "Home",
+}
+for _k, _v in DEFAULTS.items():
+    st.session_state[_k] = st.session_state.get(_k, _v)
 
-cost_side = (cost_pct + slip_pct) / 100
-symbols = parse_symbols(symbols_text)
+capital = int(st.session_state.capital)
+risk = int(st.session_state.risk)
+max_pos = int(st.session_state.max_pos)
+daily_limit = int(st.session_state.daily_limit)
+top_n = int(st.session_state.top_n)
+use_mf = bool(st.session_state.use_mf)
+breakout_days = int(st.session_state.breakout_days)
+atr_mult = float(st.session_state.atr_mult)
+rr = float(st.session_state.rr)
+trail_mult = float(st.session_state.trail_mult)
+cost_side = (float(st.session_state.cost_pct) + float(st.session_state.slip_pct)) / 100
+symbols = parse_symbols(st.session_state.symbols_text)
+today = datetime.now(IST).date()
+
+if "paper" not in st.session_state:
+    st.session_state.paper = []
+
+# ---------------------------------- Look ----------------------------------
+NAVY, ACC, GOOD, BAD = "#0B1F3A", "#0E9F6E", "#059669", "#DC2626"
+st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,500,1,0');
+:root {{ --navy:{NAVY}; --acc:{ACC}; --good:{GOOD}; --bad:{BAD}; --line:#E6E9EF; --muted:#64748B; }}
+html, body, .stApp, .stMarkdown, button, input, textarea, select {{ font-family:'Inter', sans-serif; }}
+.stApp {{ background:#F6F7FB; }}
+#MainMenu, footer {{ visibility:hidden; }}
+header[data-testid="stHeader"] {{ background:transparent; }}
+.block-container {{ padding-top:1.2rem; padding-bottom:4rem; max-width:760px; }}
+.ms {{ font-family:'Material Symbols Rounded'; font-weight:normal; font-style:normal; line-height:1;
+       letter-spacing:normal; text-transform:none; display:inline-block; white-space:nowrap;
+       -webkit-font-feature-settings:'liga'; font-feature-settings:'liga'; vertical-align:middle; }}
+
+/* Header */
+.kt-hero {{ display:flex; align-items:center; gap:12px; padding:16px 16px; border-radius:18px;
+           background:linear-gradient(135deg, #0B1F3A 0%, #15325C 100%); color:#fff; margin-bottom:12px;
+           box-shadow:0 6px 18px rgba(11,31,58,.18); }}
+.kt-logo {{ width:42px; height:42px; border-radius:12px; background:var(--acc); display:flex; align-items:center;
+           justify-content:center; font-weight:800; font-size:20px; color:#fff; flex:none; }}
+.kt-title {{ font-size:18px; font-weight:700; letter-spacing:.2px; }}
+.kt-sub {{ font-size:12.5px; color:#B8C4D6; margin-top:1px; }}
+.kt-badge {{ margin-left:auto; font-size:11px; font-weight:700; letter-spacing:.8px; color:#0B1F3A;
+            background:#D1FAE5; padding:4px 9px; border-radius:999px; }}
+
+/* Navigation strip: grey strip, chosen = white pill with accent edge. Wraps, never slides sideways. */
+.st-key-nav div[role="radiogroup"] {{ display:grid; grid-template-columns:repeat(3, 1fr); gap:4px;
+    background:#ECEFF4; border-radius:14px; padding:4px; width:100%; }}
+@media (min-width: 640px) {{ .st-key-nav div[role="radiogroup"] {{ grid-template-columns:repeat(6, 1fr); }} }}
+.st-key-nav label {{ margin:0 !important; padding:8px 4px; border-radius:10px; border:1.5px solid transparent;
+    justify-content:center; cursor:pointer; }}
+.st-key-nav label > div:first-child {{ display:none; }}
+.st-key-nav label p {{ font-size:13.5px; color:#475569; font-weight:500; }}
+.st-key-nav label:has(input:checked) {{ background:#fff; border-color:var(--acc); box-shadow:0 1px 3px rgba(15,23,42,.08); }}
+.st-key-nav label:has(input:checked) p {{ color:var(--acc); font-weight:700; }}
+
+/* Tiles */
+.kt-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0 14px; }}
+.kt-tile {{ background:#fff; border:1px solid var(--line); border-radius:16px; padding:12px 14px; }}
+.kt-lab {{ font-size:12.5px; color:var(--muted); display:flex; gap:6px; align-items:center; }}
+.kt-lab .ms {{ color:var(--acc); font-size:19px; }}
+.kt-val {{ font-size:20px; font-weight:700; color:#0F172A; margin-top:6px; }}
+.kt-val.good {{ color:var(--good); }} .kt-val.bad {{ color:var(--bad); }}
+.kt-subt {{ font-size:12px; color:#94A3B8; margin-top:2px; }}
+
+/* Section title */
+.kt-sec {{ display:flex; align-items:center; gap:8px; font-size:16px; font-weight:700; color:#0F172A; margin:18px 0 8px; }}
+.kt-sec .ms {{ color:var(--acc); font-size:22px; }}
+
+/* Status banner */
+.kt-status {{ display:flex; gap:10px; align-items:center; padding:12px 14px; border-radius:14px; margin:4px 0 10px;
+             font-size:13.5px; font-weight:500; }}
+.kt-status .ms {{ font-size:22px; }}
+.kt-status.good {{ background:#ECFDF5; color:#065F46; border:1px solid #A7F3D0; }}
+.kt-status.bad {{ background:#FEF2F2; color:#991B1B; border:1px solid #FECACA; }}
+.kt-status.info {{ background:#EFF6FF; color:#1E3A8A; border:1px solid #BFDBFE; }}
+
+/* List card */
+.kt-list {{ background:#fff; border:1px solid var(--line); border-radius:16px; overflow:hidden; margin-bottom:10px; }}
+.kt-row {{ display:flex; align-items:center; gap:12px; padding:11px 14px; border-top:1px solid #F1F3F7; }}
+.kt-row:first-child {{ border-top:none; }}
+.kt-rank {{ width:28px; height:28px; border-radius:50%; background:#E7F6F0; color:var(--acc); font-weight:700;
+           font-size:13px; display:flex; align-items:center; justify-content:center; flex:none; }}
+.kt-sym {{ font-weight:600; color:#0F172A; font-size:14.5px; }}
+.kt-meta {{ font-size:12px; color:var(--muted); }}
+.kt-right {{ margin-left:auto; text-align:right; }}
+.kt-chg {{ font-weight:700; font-size:14px; }}
+.kt-chg.good {{ color:var(--good); }} .kt-chg.bad {{ color:var(--bad); }}
+
+/* Native widgets */
+[data-testid="stMetric"] {{ background:#fff; border:1px solid var(--line); border-radius:14px; padding:10px 14px; }}
+[data-testid="stMetricValue"] {{ font-size:22px; font-weight:700; }}
+[data-testid="stExpander"] details {{ background:#fff; border:1px solid var(--line); border-radius:14px; }}
+.stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {{ border-radius:12px; font-weight:600; }}
+.stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {{ background:var(--acc); border-color:var(--acc); }}
+[data-testid="stForm"] {{ background:#fff; border:1px solid var(--line); border-radius:16px; }}
+[data-testid="stDataFrame"] {{ border-radius:12px; overflow:hidden; }}
+.kt-foot {{ font-size:11.5px; color:#94A3B8; text-align:center; margin-top:28px; line-height:1.5; }}
+</style>
+""", unsafe_allow_html=True)
+
+
+# --------------------------------- Helpers ---------------------------------
+def money(x, signed=False):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return "—"
+    s = f"₹{abs(x):,.0f}"
+    if signed:
+        return ("+" if x >= 0 else "−") + s
+    return ("−" if x < 0 else "") + s
+
+
+def tone(x):
+    return "good" if x > 0 else ("bad" if x < 0 else "")
+
+
+def section(icon, text):
+    st.markdown(f'<div class="kt-sec"><span class="ms">{icon}</span>{text}</div>', unsafe_allow_html=True)
+
+
+def status(kind, icon, text):
+    st.markdown(f'<div class="kt-status {kind}"><span class="ms">{icon}</span><div>{text}</div></div>',
+                unsafe_allow_html=True)
+
+
+def tiles(items):
+    html = ""
+    for icon, label, value, sub, tn in items:
+        html += (f'<div class="kt-tile"><div class="kt-lab"><span class="ms">{icon}</span>{label}</div>'
+                 f'<div class="kt-val {tn}">{value}</div><div class="kt-subt">{sub}</div></div>')
+    st.markdown(f'<div class="kt-grid">{html}</div>', unsafe_allow_html=True)
+
+
+def footer():
+    st.markdown('<div class="kt-foot">Paper / research only · Not investment advice · Not connected to any broker<br>'
+                'Prices from Yahoo Finance may be delayed or incomplete</div>', unsafe_allow_html=True)
 
 
 def load_universe(syms, period):
@@ -472,132 +585,248 @@ def load_universe(syms, period):
     return data, nifty, mk, [short_name(f) for f in failed if f != "^NSEI"]
 
 
-tab_rules, tab_scan, tab_bt, tab_stock, tab_paper = st.tabs(
-    ["📋 Rules", "🔍 Scanner", "📊 Backtest", "📈 Single stock", "📝 Paper trades"]
-)
+def market_state(nifty):
+    if nifty is None or len(nifty) < 200:
+        return None, None, None
+    c = float(nifty["Close"].iloc[-1])
+    a = float(nifty["Close"].rolling(200).mean().iloc[-1])
+    return c > a, c, a
 
-# ------------------------------- Rules -------------------------------
-STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
 
-with tab_rules:
-    st.subheader("Three strategies, tested side by side")
-    st.markdown(f"""
-All three trade only Nifty 50 stocks, delivery (no leverage, no options).
-**Market filter:** {"new buying only when Nifty 50 is above its 200-day average" if use_mf else "OFF"}.
+def last_weekday(y, m):
+    d = pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d.date()
 
-**A. Breakout + fixed target** (checked daily after 3:30 pm)
-- Buy when: close above 200-day average, EMA20 above EMA50, and close breaks the {breakout_days}-day high.
-- Stop-loss: entry − {atr_mult:g} × ATR. Target: {rr:g} × risk. Also sell on a close below EMA50.
-- Risk ₹{risk:,} per trade, max {max_pos} trades, no new trade after a ₹{daily_limit:,} loss day.
 
-**B. Breakout + trailing stop** (checked daily after 3:30 pm)
-- Same buy signal and starting stop as A, but **no fixed target**.
-- The stop rises behind the highest close ({trail_mult:g} × ATR below it) and never moves down. Winners are allowed to run.
+def next_rebalance(d):
+    lw = last_weekday(d.year, d.month)
+    if d > lw:
+        nm = pd.Timestamp(d.year, d.month, 1) + pd.offsets.MonthBegin(1)
+        lw = last_weekday(nm.year, nm.month)
+    return lw
 
-**C. Monthly momentum** (checked once a month, last trading day)
-- Rank stocks above their 200-day average by 6-month return.
-- Hold the top {top_n} in equal amounts (₹{capital/top_n:,.0f} each). Keep a stock while it stays in the top {2*top_n}.
-- If Nifty 50 falls below its 200-day average, sell everything and wait in cash.
-- About 15–30 minutes of work per month.
-""")
-    st.info("Run the Backtest tab and compare all three against simply holding Nifty 50. Keep the one that wins over 10 years, "
-            "then paper trade it for 2 months before using real money.")
 
-# ------------------------------ Scanner ------------------------------
-with tab_scan:
-    st.subheader("Today's scanner")
-    st.caption("Best used after 3:30 pm, when the day's candle is complete. During market hours the last candle is still changing.")
-    if st.button("Scan Nifty 50 now", type="primary", width="stretch"):
-        with st.spinner("Loading prices for all stocks..."):
-            data, nifty, mk, failed = load_universe(symbols, "1y")
-        mk_now = bool(mk.iloc[-1]) if mk is not None and len(mk) else True
-        st.session_state.scan = {
-            "table": scan(data, capital, risk, max_pos, atr_mult, rr),
-            "mom": momentum_picks(data, mk_now, top_n),
-            "nifty": nifty, "failed": failed,
-            "time": datetime.now(IST).strftime("%d %b %Y, %I:%M %p"),
-        }
-    res = st.session_state.get("scan")
-    if res:
-        nifty = res["nifty"]
-        if nifty is not None and len(nifty) >= 200:
-            n_close, n_sma = float(nifty["Close"].iloc[-1]), float(nifty["Close"].rolling(200).mean().iloc[-1])
-            if n_close > n_sma:
-                st.success(f"Market filter: Nifty 50 ({n_close:,.0f}) is above its 200-day average ({n_sma:,.0f}). Buying allowed.")
-            else:
-                msg = f"Market filter: Nifty 50 ({n_close:,.0f}) is below its 200-day average ({n_sma:,.0f})."
-                if use_mf:
-                    st.error(msg + " No new buying by the rules.")
-                else:
-                    st.warning(msg + " (Filter is OFF in settings.)")
-        else:
-            st.warning("Could not load Nifty 50 index data, so the market filter could not be checked.")
-        st.caption(f"Scanned at {res['time']}")
+def last_price(data, sym):
+    key = to_yf(sym)
+    if key in data and not data[key].empty:
+        return float(data[key]["Close"].iloc[-1])
+    return None
 
-        st.write("### Strategy A / B: breakout signals")
-        table = res["table"]
-        buys = table[table["Signal"] == "BUY"] if not table.empty else table
-        st.metric("BUY signals today", len(buys))
+
+def paper_summary(data):
+    paper = st.session_state.paper
+    invested = open_pl = realized = 0.0
+    n_open = 0
+    for t in paper:
+        if t["Status"] == "Open":
+            n_open += 1
+            px = last_price(data, t["Symbol"]) if data else None
+            px = px if px is not None else t["Entry ₹"]
+            invested += t["Qty"] * t["Entry ₹"]
+            open_pl += t["Qty"] * (px - t["Entry ₹"])
+        elif t["P/L (₹)"] is not None:
+            realized += float(t["P/L (₹)"])
+    return {"invested": invested, "open_pl": open_pl, "realized": realized, "n_open": n_open}
+
+
+def add_paper(sym, qty, entry, stop=None, target=None, strategy="Manual"):
+    paper = st.session_state.paper
+    paper.append({
+        "ID": max([t["ID"] for t in paper], default=0) + 1, "Date": str(today), "Strategy": strategy,
+        "Symbol": sym.strip().upper(), "Qty": int(qty), "Entry ₹": round(float(entry), 2),
+        "Stop-loss ₹": round(float(stop), 2) if stop else None,
+        "Target ₹": round(float(target), 2) if target else None,
+        "Status": "Open", "Exit date": "", "Exit ₹": None, "P/L (₹)": None,
+    })
+
+
+def picks_html(df):
+    rows = ""
+    for _, r in df.iterrows():
+        ch = r["6M return %"]
+        amt = money(capital / top_n)
+        rows += (f'<div class="kt-row"><div class="kt-rank">{int(r["Rank"])}</div>'
+                 f'<div><div class="kt-sym">{r["Symbol"]}</div><div class="kt-meta">Close ₹{r["Close ₹"]:,.2f}</div></div>'
+                 f'<div class="kt-right"><div class="kt-chg {tone(ch)}">{ch:+.1f}%</div>'
+                 f'<div class="kt-meta">6 months · {amt}</div></div></div>')
+    return f'<div class="kt-list">{rows}</div>'
+
+
+# --------------------------------- Header & nav ---------------------------------
+st.markdown("""
+<div class="kt-hero">
+  <div class="kt-logo">K</div>
+  <div><div class="kt-title">Kush Algo Trader</div><div class="kt-sub">Momentum strategy · Paper trading</div></div>
+  <div class="kt-badge">PAPER</div>
+</div>
+""", unsafe_allow_html=True)
+
+NAV = ["Home", "Scanner", "Backtest", "Paper", "Stock", "Settings"]
+NAV_ICON = {"Home": ":material/home:", "Scanner": ":material/radar:", "Backtest": ":material/query_stats:",
+            "Paper": ":material/receipt_long:", "Stock": ":material/candlestick_chart:", "Settings": ":material/tune:"}
+if st.session_state.nav not in NAV:
+    st.session_state.nav = "Home"
+page = st.radio("Navigation", NAV, key="nav", horizontal=True, label_visibility="collapsed",
+                format_func=lambda x: f"{NAV_ICON[x]} {x}")
+
+
+# =================================== HOME ===================================
+def page_home():
+    with st.spinner("Loading market data..."):
+        data, nifty, mk, failed = load_universe(symbols, "1y")
+    ok, n_close, n_avg = market_state(nifty)
+    mk_now = True if (ok is None or not use_mf) else ok
+    reb = next_rebalance(today)
+    days_left = (reb - today).days
+    ps = paper_summary(data)
+
+    if ok is None:
+        status("info", "info", "Could not load Nifty 50 data, so the market filter could not be checked.")
+    elif ok:
+        status("good", "trending_up", f"<b>Market OK.</b> Nifty 50 {n_close:,.0f} is above its 200-day average {n_avg:,.0f}. Buying allowed.")
+    else:
+        status("bad", "trending_down", f"<b>Market weak.</b> Nifty 50 {n_close:,.0f} is below its 200-day average {n_avg:,.0f}. "
+               + ("Rules say: stay in cash." if use_mf else "Market filter is OFF in Settings."))
+
+    tiles([
+        ("event", "Next rebalance", "Today" if days_left == 0 else f"{days_left} days", reb.strftime("%a, %d %b %Y"), ""),
+        ("account_balance_wallet", "Paper invested", money(ps["invested"]), f"{ps['n_open']} open positions", ""),
+        ("show_chart", "Open P/L", money(ps["open_pl"], signed=True), "on open positions", tone(ps["open_pl"])),
+        ("savings", "Booked P/L", money(ps["realized"], signed=True), "closed paper trades", tone(ps["realized"])),
+    ])
+
+    picks = momentum_picks(data, mk_now, top_n)
+    section("workspace_premium", f"This month's top {top_n}")
+    if picks is None or picks.empty:
+        st.info("No data for picks.")
+        return
+    chosen = picks[picks["Pick"] != ""]
+    if chosen.empty:
+        status("bad", "block", "No stock qualifies right now (market filter or no stock in an uptrend). Stay in cash.")
+    else:
+        st.markdown(picks_html(chosen), unsafe_allow_html=True)
+        st.caption(f"About {money(capital / top_n)} in each. Act only on rebalance day "
+                   "(last trading day of the month; one day earlier if it is a market holiday).")
+
+        # What the paper portfolio should change on rebalance day
+        open_c = [t for t in st.session_state.paper if t["Status"] == "Open" and t.get("Strategy") == "C"]
+        keep_zone = set(picks.loc[picks["Rank"].notna() & (picks["Rank"].fillna(999).astype(int) <= 2 * top_n), "Symbol"])
+        to_sell = [t["Symbol"] for t in open_c if (not mk_now) or t["Symbol"] not in keep_zone]
+        held = {t["Symbol"] for t in open_c}
+        to_buy = [s for s in chosen["Symbol"] if s not in held]
+        free_slots = max(0, top_n - (len(held) - len(set(to_sell))))
+        to_buy = to_buy[:free_slots]
+
+        if open_c or to_buy:
+            section("swap_horiz", "On rebalance day")
+            c1, c2 = st.columns(2)
+            c1.markdown("**Sell**<br>" + (", ".join(to_sell) if to_sell else "Nothing"), unsafe_allow_html=True)
+            c2.markdown("**Buy**<br>" + (", ".join(to_buy) if to_buy else "Nothing"), unsafe_allow_html=True)
+
+        if to_buy and st.button(f"Record {len(to_buy)} buy(s) as paper trades", type="primary", width="stretch",
+                                icon=":material/add_task:"):
+            added = 0
+            for s in to_buy:
+                px = last_price(data, s)
+                if px:
+                    qty = int((capital / top_n) // px)
+                    if qty >= 1:
+                        add_paper(s, qty, px, strategy="C")
+                        added += 1
+            st.toast(f"{added} paper trade(s) recorded")
+            st.rerun()
+        if to_sell:
+            st.caption("Close the 'Sell' stocks in the Paper page with their exit price.")
+    if failed:
+        st.caption("Could not load: " + ", ".join(failed))
+
+
+# ================================== SCANNER ==================================
+def page_scanner():
+    top = st.columns([3, 1])
+    top[0].caption("Prices refresh every hour. Best checked after 3:30 pm.")
+    if top[1].button("Refresh", icon=":material/refresh:", width="stretch"):
+        fetch_many.clear()
+        st.rerun()
+    with st.spinner("Loading prices for all stocks..."):
+        data, nifty, mk, failed = load_universe(symbols, "1y")
+    ok, n_close, n_avg = market_state(nifty)
+    mk_now = True if (ok is None or not use_mf) else ok
+    if ok is not None:
+        status("good" if ok else "bad", "trending_up" if ok else "trending_down",
+               f"Nifty 50 {n_close:,.0f} vs 200-day average {n_avg:,.0f}")
+
+    section("workspace_premium", "Momentum ranking (strategy C)")
+    st.caption(f"Stocks above their 200-day average, ranked by 6-month return. Hold the top {top_n}; "
+               f"keep an old holding while it ranks {2 * top_n} or better.")
+    mom = momentum_picks(data, mk_now, top_n)
+    if mom is not None and not mom.empty:
+        st.dataframe(mom.head(max(2 * top_n, 10)), width="stretch", hide_index=True)
+        with st.expander("Full ranking"):
+            st.dataframe(mom, width="stretch", hide_index=True)
+
+    section("bolt", "Breakout signals (strategies A / B)")
+    st.caption("Kept for comparison only. These strategies did not pass the 10-year backtest.")
+    table = scan(data, capital, risk, max_pos, atr_mult, rr)
+    buys = table[table["Signal"] == "BUY"] if not table.empty else table
+    with st.expander(f"Breakout BUY signals today: {len(buys)}"):
         if len(buys):
             st.dataframe(buys, width="stretch", hide_index=True)
-            st.caption(f"Take at most your free slots (max {max_pos}), from the top. For strategy B, ignore the target column.")
         else:
-            st.info("No breakout signal today.")
-        with st.expander("All stocks (breakout view)"):
-            st.dataframe(table, width="stretch", hide_index=True)
+            st.write("No breakout signal today.")
+    if failed:
+        st.caption("Could not load: " + ", ".join(failed))
 
-        st.write("### Strategy C: momentum portfolio")
-        st.caption(f"Act on this only on the last trading day of the month. Hold the stocks marked BUY / HOLD "
-                   f"(about ₹{capital/top_n:,.0f} each). Keep an old holding if its rank is {2*top_n} or better.")
-        mom = res["mom"]
-        if mom is not None and not mom.empty:
-            st.dataframe(mom.head(max(2 * top_n, 10)), width="stretch", hide_index=True)
-        if res["failed"]:
-            st.caption("Could not load: " + ", ".join(res["failed"]))
 
-# ------------------------------ Backtest ------------------------------
-def show_details(result, capital, nifty):
+# ================================== BACKTEST ==================================
+STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, "Nifty 50 buy & hold": NAVY}
+
+
+def show_details(result, cap, nifty):
     eq, trades = result["equity"], result["trades"]
-    s = summarize(eq, trades, capital)
-    c5, c6 = st.columns(2)
-    c5.metric("Closed trades", s["n"])
-    c6.metric("Win rate", f"{s['win_rate']:.1f}%")
-    c7, c8 = st.columns(2)
-    c7.metric("Average win / loss", f"₹{s['avg_win']:,.0f} / ₹{s['avg_loss']:,.0f}")
-    c8.metric("Profit factor", f"{s['pf']:.2f}" if np.isfinite(s["pf"]) else "∞")
+    s = summarize(eq, trades, cap)
+    c1, c2 = st.columns(2)
+    c1.metric("Closed trades", s["n"])
+    c2.metric("Win rate", f"{s['win_rate']:.1f}%")
+    c3, c4 = st.columns(2)
+    c3.metric("Avg win / loss", f"₹{s['avg_win']:,.0f} / ₹{abs(s['avg_loss']):,.0f}")
+    c4.metric("Profit factor", f"{s['pf']:.2f}" if np.isfinite(s["pf"]) else "∞")
     yearly = eq.groupby(eq.index.year).last()
-    prev = yearly.shift(1).fillna(capital)
-    ytab = pd.DataFrame({"Year": yearly.index, "Strategy %": ((yearly / prev - 1) * 100).round(1).values})
+    prev = yearly.shift(1).fillna(cap)
+    ytab = pd.DataFrame({"Year": yearly.index.astype(str), "Strategy %": ((yearly / prev - 1) * 100).round(1).values})
     if nifty is not None:
         nc = nifty["Close"].reindex(eq.index).ffill().bfill()
         ny = nc.groupby(nc.index.year).last()
         nprev = ny.shift(1).fillna(nc.iloc[0])
         ytab["Nifty 50 %"] = ((ny / nprev - 1) * 100).round(1).values
-    st.write("**Return by year**")
+    section("calendar_month", "Return by year")
     st.dataframe(ytab, width="stretch", hide_index=True)
     if s["n"]:
-        st.write("**Exit reasons**")
+        section("logout", "Exit reasons")
         st.dataframe(trades["Exit reason"].value_counts().rename_axis("Reason").reset_index(name="Trades"),
                      width="stretch", hide_index=True)
-        st.write("**Profit / loss by stock**")
-        st.bar_chart(trades.groupby("Symbol")["P/L (₹)"].sum().sort_values(), height=300)
+        section("bar_chart", "Profit / loss by stock")
+        st.bar_chart(trades.groupby("Symbol")["P/L (₹)"].sum().sort_values(), height=300, color=ACC)
         with st.expander(f"All {s['n']} trades"):
             st.dataframe(trades, width="stretch", hide_index=True)
             st.download_button("Download trades CSV", trades.to_csv(index=False).encode("utf-8"),
-                               file_name="kush_backtest_trades.csv", mime="text/csv")
+                               file_name="kush_backtest_trades.csv", mime="text/csv", icon=":material/download:")
     if not result["open"].empty:
-        st.write("**Still open at the end**")
+        section("hourglass_top", "Still open at the end")
         st.dataframe(result["open"], width="stretch", hide_index=True)
     if result["blocked_days"]:
         st.caption(f"Daily loss limit was hit on {result['blocked_days']} day(s).")
 
 
-with tab_bt:
-    st.subheader("Compare all strategies")
-    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, and compares them with simply holding Nifty 50.")
+def page_backtest():
+    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, "
+               "and compares them with simply holding Nifty 50.")
     period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
     period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[period_label]
-    if st.button("Run all backtests", type="primary", width="stretch"):
+    if st.button("Run all backtests", type="primary", width="stretch", icon=":material/play_arrow:"):
         with st.spinner("Downloading data and simulating... this can take 1–2 minutes"):
             data, nifty, mk, failed = load_universe(symbols, period)
             results = {
@@ -608,182 +837,242 @@ with tab_bt:
             }
         st.session_state.bt = {"results": results, "nifty": nifty, "failed": failed, "capital": capital}
     bt = st.session_state.get("bt")
-    if bt and "results" in bt:
-        results, cap, nifty = bt["results"], bt["capital"], bt["nifty"]
-        valid = {k: v for k, v in results.items() if v is not None}
-        if not valid:
-            st.error("Not enough data to run the backtest. Try a longer period.")
-        else:
-            first = next(iter(valid.values()))["equity"]
-            st.caption(f"Test period: {first.index[0]:%d %b %Y} to {first.index[-1]:%d %b %Y} "
-                       "(the first ~200 trading days are used only to calculate averages).")
-            rows, chart = [], pd.DataFrame(index=first.index)
-            for name, r in valid.items():
-                s = summarize(r["equity"], r["trades"], cap)
-                rows.append({"Strategy": name, "Ending ₹": round(s["final"]), "Total %": round(s["total"], 1),
-                             "Yearly % (CAGR)": round(s["cagr"], 1), "Worst fall %": round(s["max_dd"], 1),
-                             "Trades": s["n"]})
-                chart[name] = r["equity"]
-            if nifty is not None:
-                nc = nifty["Close"].reindex(first.index).ffill().bfill()
-                bench = cap * nc / nc.iloc[0]
-                bs = summarize(bench, pd.DataFrame(), cap)
-                rows.append({"Strategy": "Nifty 50 buy & hold", "Ending ₹": round(bs["final"]), "Total %": round(bs["total"], 1),
-                             "Yearly % (CAGR)": round(bs["cagr"], 1), "Worst fall %": round(bs["max_dd"], 1), "Trades": 0})
-                chart["Nifty 50 buy & hold"] = bench
-            comp = pd.DataFrame(rows).sort_values("Yearly % (CAGR)", ascending=False).reset_index(drop=True)
-            st.dataframe(comp, width="stretch", hide_index=True)
-            best = comp.iloc[0]["Strategy"]
-            if best == "Nifty 50 buy & hold":
-                st.warning("Simply holding Nifty 50 beat every strategy in this test.")
-            else:
-                st.success(f"Best yearly return in this test: {best}. Check the 'Worst fall' column too: "
-                           "a big fall is hard to sit through with real money.")
-            st.line_chart(chart, height=320)
+    if not (bt and "results" in bt):
+        return
+    results, cap, nifty = bt["results"], bt["capital"], bt["nifty"]
+    valid = {k: v for k, v in results.items() if v is not None}
+    if not valid:
+        st.error("Not enough data to run the backtest. Try a longer period.")
+        return
+    first = next(iter(valid.values()))["equity"]
+    rows, chart = [], pd.DataFrame(index=first.index)
+    for name, r in valid.items():
+        s = summarize(r["equity"], r["trades"], cap)
+        rows.append({"Strategy": name, "Ending ₹": round(s["final"]), "Total %": round(s["total"], 1),
+                     "Yearly %": round(s["cagr"], 1), "Worst fall %": round(s["max_dd"], 1), "Trades": s["n"]})
+        chart[name] = r["equity"]
+    if nifty is not None:
+        nc = nifty["Close"].reindex(first.index).ffill().bfill()
+        bench = cap * nc / nc.iloc[0]
+        bs = summarize(bench, pd.DataFrame(), cap)
+        rows.append({"Strategy": "Nifty 50 buy & hold", "Ending ₹": round(bs["final"]), "Total %": round(bs["total"], 1),
+                     "Yearly %": round(bs["cagr"], 1), "Worst fall %": round(bs["max_dd"], 1), "Trades": 0})
+        chart["Nifty 50 buy & hold"] = bench
+    comp = pd.DataFrame(rows).sort_values("Yearly %", ascending=False).reset_index(drop=True)
+    best = comp.iloc[0]
 
-            pick = st.selectbox("See details of", list(valid.keys()))
-            show_details(valid[pick], cap, nifty)
-            st.caption("Limitations: uses today's Nifty 50 list for the past (makes results look better than reality), "
-                       "dividend-adjusted prices, simple cost estimate, no tax, and orders assumed to fill at the open or "
-                       "exactly at the stop/target. Gaps can cause bigger losses than planned. Past results do not "
-                       "guarantee future results.")
-            if bt["failed"]:
-                st.caption("Could not load: " + ", ".join(bt["failed"]))
+    section("emoji_events", "Result")
+    st.caption(f"Test period: {first.index[0]:%d %b %Y} to {first.index[-1]:%d %b %Y}")
+    tiles([
+        ("emoji_events", "Best strategy", best["Strategy"].split(". ")[-1], f"{best['Yearly %']}% a year", "good"),
+        ("trending_down", "Its worst fall", f"{best['Worst fall %']}%", "from a peak", "bad"),
+    ])
+    st.dataframe(comp, width="stretch", hide_index=True)
+    st.line_chart(chart, height=320, color=[LINE_COLORS.get(c, "#64748B") for c in chart.columns])
 
-# ---------------------------- Single stock ----------------------------
-with tab_stock:
-    st.subheader("Check one stock")
-    sym_in = st.text_input("NSE symbol (e.g. TCS, INFY, HDFCBANK)", "TCS")
-    sym_period_label = st.selectbox("Data period ", ["2 years", "5 years", "10 years"], index=1)
-    sym_period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[sym_period_label]
-    one = parse_symbols(sym_in)[:1]
-    if one:
-        with st.spinner("Loading..."):
-            data1, nifty1, mk1, failed1 = load_universe(one, sym_period)
-        if not data1:
-            st.error(f"No data found for {one[0]}. Check the symbol spelling.")
-        else:
-            key = list(data1.keys())[0]
-            d = data1[key]
-            last = d.iloc[-1]
-            st.line_chart(d[["Close", "EMA20", "EMA50", "SMA200"]].tail(250), height=300)
-            if bool(last["Entry"]):
-                sig = "BUY"
-            elif bool(last["Trend_OK"]):
-                sig = "Uptrend, wait for breakout"
-            else:
-                sig = "No trade"
-            a1, a2 = st.columns(2)
-            a1.metric("Latest close", f"₹{last['Close']:,.2f}")
-            a2.metric("Signal", sig)
-            style = st.radio("Exit style", ["Fixed target (A)", "Trailing stop (B)"], horizontal=True)
-            r1 = run_backtest(data1, mk1, capital, risk, 1, daily_limit, atr_mult, rr, cost_side,
-                              exit_mode="target" if style.startswith("Fixed") else "trail", trail_mult=trail_mult)
-            if r1 is None:
-                st.info("Not enough history for a backtest on this stock.")
-            else:
-                s1 = summarize(r1["equity"], r1["trades"], capital)
-                b1, b2 = st.columns(2)
-                b1.metric("Strategy return", f"{s1['total']:.1f}%")
-                b2.metric("Closed trades", s1["n"])
-                b3, b4 = st.columns(2)
-                b3.metric("Win rate", f"{s1['win_rate']:.1f}%")
-                b4.metric("Max drawdown", f"{s1['max_dd']:.1f}%")
-                if s1["n"]:
-                    st.dataframe(r1["trades"], width="stretch", hide_index=True)
-                st.caption("One stock alone is a weak test. The Backtest tab (all stocks) matters more.")
+    pick = st.selectbox("See details of", list(valid.keys()), index=len(valid) - 1)
+    show_details(valid[pick], cap, nifty)
+    st.caption("Limitations: uses today's Nifty 50 list for the past (makes results look better than reality), "
+               "dividend-adjusted prices, simple cost estimate, no tax, and orders assumed to fill at the open or "
+               "exactly at the stop/target. Past results do not guarantee future results.")
+    if bt["failed"]:
+        st.caption("Could not load: " + ", ".join(bt["failed"]))
 
-# ---------------------------- Paper trades ----------------------------
-with tab_paper:
-    st.subheader("Paper trade log")
-    st.caption("Virtual trades only. The log lives in this browser session: download the CSV after each update "
-               "and load it back next time.")
-    if "paper" not in st.session_state:
-        st.session_state.paper = []
+
+# =================================== PAPER ===================================
+def page_paper():
+    with st.spinner("Loading prices..."):
+        data, _, _, _ = load_universe(symbols, "1y")
     paper = st.session_state.paper
-    today = datetime.now(IST).date()
-    open_trades = [t for t in paper if t["Status"] == "Open"]
+    ps = paper_summary(data)
     today_pl = sum(float(t["P/L (₹)"] or 0) for t in paper
                    if t["Status"] == "Closed" and str(t["Exit date"]) == str(today))
-
-    p1, p2 = st.columns(2)
-    p1.metric("Open trades", f"{len(open_trades)} / {max_pos}")
-    p2.metric("Today's closed P/L", f"₹{today_pl:,.0f}")
+    tiles([
+        ("account_balance_wallet", "Invested", money(ps["invested"]), f"{ps['n_open']} open", ""),
+        ("show_chart", "Open P/L", money(ps["open_pl"], signed=True), "at last close", tone(ps["open_pl"])),
+        ("savings", "Booked P/L", money(ps["realized"], signed=True), "all closed trades", tone(ps["realized"])),
+        ("today", "Booked today", money(today_pl, signed=True), str(today), tone(today_pl)),
+    ])
     if today_pl <= -daily_limit:
-        st.error(f"Daily loss limit of ₹{daily_limit:,} reached. No new trades by the rules.")
-    elif len(open_trades) >= max_pos:
-        st.warning("All trade slots are full. Wait for a trade to close.")
-
-    with st.form("add_paper", clear_on_submit=True):
-        st.write("**Add a trade** (copy values from the Scanner)")
-        f1, f2 = st.columns(2)
-        f_sym = f1.text_input("Symbol")
-        f_qty = f2.number_input("Qty", min_value=1, value=1, step=1)
-        f3, f4, f5 = st.columns(3)
-        f_entry = f3.number_input("Entry ₹", min_value=0.0, value=None, step=0.05)
-        f_stop = f4.number_input("Stop-loss ₹", min_value=0.0, value=None, step=0.05)
-        f_target = f5.number_input("Target ₹", min_value=0.0, value=None, step=0.05)
-        if st.form_submit_button("Add paper trade", type="primary", width="stretch"):
-            if not f_sym or f_entry is None or f_stop is None or f_target is None:
-                st.error("Fill in symbol, entry, stop-loss and target.")
-            elif not (f_stop < f_entry < f_target):
-                st.error("For a buy, stop-loss must be below entry and target above entry.")
-            else:
-                planned_risk = (f_entry - f_stop) * f_qty
-                paper.append({
-                    "ID": max([t["ID"] for t in paper], default=0) + 1, "Date": str(today),
-                    "Symbol": f_sym.strip().upper(), "Qty": int(f_qty), "Entry ₹": round(f_entry, 2),
-                    "Stop-loss ₹": round(f_stop, 2), "Target ₹": round(f_target, 2), "Status": "Open",
-                    "Exit date": "", "Exit ₹": None, "P/L (₹)": None,
-                })
-                if planned_risk > risk:
-                    st.warning(f"Planned risk ₹{planned_risk:,.0f} is more than your ₹{risk:,} rule.")
-                st.success("Paper trade added.")
-                st.rerun()
+        status("bad", "block", f"Daily loss limit of {money(daily_limit)} reached. No new trades today.")
 
     open_trades = [t for t in paper if t["Status"] == "Open"]
     if open_trades:
+        section("inventory_2", "Open positions")
+        rows = []
+        for t in open_trades:
+            px = last_price(data, t["Symbol"])
+            pl = t["Qty"] * (px - t["Entry ₹"]) if px else None
+            rows.append({"#": t["ID"], "Strategy": t.get("Strategy", "Manual"), "Symbol": t["Symbol"], "Qty": t["Qty"],
+                         "Entry ₹": t["Entry ₹"], "Last ₹": round(px, 2) if px else None,
+                         "P/L ₹": round(pl, 2) if pl is not None else None,
+                         "Stop ₹": t.get("Stop-loss ₹"), "Target ₹": t.get("Target ₹")})
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
         with st.form("close_paper"):
-            st.write("**Close a trade**")
+            st.markdown("**Close a position**")
             labels = {t["ID"]: f"#{t['ID']} {t['Symbol']} × {t['Qty']} @ ₹{t['Entry ₹']}" for t in open_trades}
-            c_id = st.selectbox("Trade", list(labels.keys()), format_func=lambda x: labels[x])
-            c_px = st.number_input("Exit price ₹", min_value=0.0, value=None, step=0.05)
-            if st.form_submit_button("Close trade", width="stretch"):
-                if c_px is None:
-                    st.error("Enter the exit price.")
-                else:
-                    for t in paper:
-                        if t["ID"] == c_id:
-                            t["Status"], t["Exit date"], t["Exit ₹"] = "Closed", str(today), round(c_px, 2)
-                            t["P/L (₹)"] = round((c_px - t["Entry ₹"]) * t["Qty"], 2)
-                    st.rerun()
+            c_id = st.selectbox("Position", list(labels.keys()), format_func=lambda x: labels[x])
+            c_px = st.number_input("Exit price ₹ (leave empty to use last close)", min_value=0.0, value=None, step=0.05)
+            if st.form_submit_button("Close position", width="stretch", icon=":material/check_circle:"):
+                for t in paper:
+                    if t["ID"] == c_id:
+                        px = c_px if c_px else last_price(data, t["Symbol"])
+                        if not px:
+                            st.error("No price found. Enter the exit price.")
+                            break
+                        t["Status"], t["Exit date"], t["Exit ₹"] = "Closed", str(today), round(px, 2)
+                        t["P/L (₹)"] = round((px - t["Entry ₹"]) * t["Qty"], 2)
+                        st.rerun()
 
+    with st.form("add_paper", clear_on_submit=True):
+        st.markdown("**Add a position**")
+        f1, f2 = st.columns(2)
+        f_sym = f1.text_input("Symbol")
+        f_strat = f2.selectbox("Strategy", ["C", "A", "B", "Manual"])
+        f3, f4 = st.columns(2)
+        f_qty = f3.number_input("Qty", min_value=1, value=1, step=1)
+        f_entry = f4.number_input("Entry ₹ (empty = last close)", min_value=0.0, value=None, step=0.05)
+        f5, f6 = st.columns(2)
+        f_stop = f5.number_input("Stop-loss ₹ (optional)", min_value=0.0, value=None, step=0.05)
+        f_target = f6.number_input("Target ₹ (optional)", min_value=0.0, value=None, step=0.05)
+        if st.form_submit_button("Add position", type="primary", width="stretch", icon=":material/add:"):
+            entry = f_entry if f_entry else (last_price(data, f_sym) if f_sym else None)
+            if not f_sym or not entry:
+                st.error("Enter a valid symbol (and entry price if it is not a Nifty 50 stock).")
+            elif (f_stop and f_stop >= entry) or (f_target and f_target <= entry):
+                st.error("Stop-loss must be below entry and target above entry.")
+            else:
+                if f_stop and (entry - f_stop) * f_qty > risk:
+                    st.warning(f"Planned risk {money((entry - f_stop) * f_qty)} is more than your {money(risk)} rule.")
+                add_paper(f_sym, f_qty, entry, f_stop, f_target, f_strat)
+                st.toast("Position added")
+                st.rerun()
+
+    closed = [t for t in paper if t["Status"] == "Closed"]
+    if closed:
+        with st.expander(f"Closed trades ({len(closed)})"):
+            st.dataframe(pd.DataFrame(closed), width="stretch", hide_index=True)
+
+    section("save", "Save your log")
+    st.caption("The log lives in this browser session. Download it after each change and load it back next time.")
     if paper:
-        log = pd.DataFrame(paper)
-        st.dataframe(log, width="stretch", hide_index=True)
-        closed = log[log["Status"] == "Closed"]
-        if len(closed):
-            st.metric("Total closed P/L (before costs)", f"₹{closed['P/L (₹)'].astype(float).sum():,.0f}")
-        st.download_button("Download paper log CSV", log.to_csv(index=False).encode("utf-8"),
-                           file_name="kush_paper_trades.csv", mime="text/csv", width="stretch")
+        st.download_button("Download paper log", pd.DataFrame(paper).to_csv(index=False).encode("utf-8"),
+                           file_name="kush_paper_trades.csv", mime="text/csv", width="stretch", icon=":material/download:")
+    up = st.file_uploader("Load a saved log (CSV)", type=["csv"])
+    if up is not None and st.button("Load this file", width="stretch", icon=":material/upload:"):
+        try:
+            df_up = pd.read_csv(up, keep_default_na=False)
+            need = ["ID", "Date", "Symbol", "Qty", "Entry ₹", "Stop-loss ₹", "Target ₹", "Status", "Exit date", "Exit ₹", "P/L (₹)"]
+            if not set(need).issubset(df_up.columns):
+                st.error("This is not a Kush paper log file.")
+            else:
+                def num(v):
+                    v = str(v).strip()
+                    return float(v) if v not in ("", "None", "nan") else None
+                recs = []
+                for r in df_up.to_dict("records"):
+                    recs.append({
+                        "ID": int(r["ID"]), "Date": str(r["Date"]), "Strategy": str(r.get("Strategy", "") or "Manual"),
+                        "Symbol": str(r["Symbol"]), "Qty": int(r["Qty"]), "Entry ₹": num(r["Entry ₹"]),
+                        "Stop-loss ₹": num(r["Stop-loss ₹"]), "Target ₹": num(r["Target ₹"]), "Status": str(r["Status"]),
+                        "Exit date": "" if str(r["Exit date"]) in ("None", "nan") else str(r["Exit date"]),
+                        "Exit ₹": num(r["Exit ₹"]), "P/L (₹)": num(r["P/L (₹)"]),
+                    })
+                st.session_state.paper = recs
+                st.toast(f"Loaded {len(recs)} trades")
+                st.rerun()
+        except Exception as e:
+            st.error(f"Could not read the file: {e}")
 
-    with st.expander("Load a saved paper log"):
-        up = st.file_uploader("Choose the CSV you downloaded earlier", type=["csv"])
-        if up is not None and st.button("Load this file"):
-            try:
-                df_up = pd.read_csv(up, keep_default_na=False)
-                need = {"ID", "Date", "Symbol", "Qty", "Entry ₹", "Stop-loss ₹", "Target ₹", "Status", "Exit date", "Exit ₹", "P/L (₹)"}
-                if not need.issubset(df_up.columns):
-                    st.error("This is not a Kush paper log file.")
-                else:
-                    recs = df_up[list(need)].to_dict("records")
-                    for r in recs:
-                        r["ID"], r["Qty"] = int(r["ID"]), int(r["Qty"])
-                        r["Exit ₹"] = float(r["Exit ₹"]) if str(r["Exit ₹"]).strip() not in ("", "None", "nan") else None
-                        r["P/L (₹)"] = float(r["P/L (₹)"]) if str(r["P/L (₹)"]).strip() not in ("", "None", "nan") else None
-                        r["Exit date"] = "" if str(r["Exit date"]) in ("None", "nan") else str(r["Exit date"])
-                    st.session_state.paper = recs
-                    st.success(f"Loaded {len(recs)} trades.")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Could not read the file: {e}")
+
+# =================================== STOCK ===================================
+def page_stock():
+    c1, c2 = st.columns([2, 1])
+    sym_in = c1.text_input("NSE symbol", "TCS")
+    sym_period_label = c2.selectbox("Period", ["2 years", "5 years", "10 years"], index=1)
+    sym_period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[sym_period_label]
+    one = parse_symbols(sym_in)[:1]
+    if not one:
+        return
+    with st.spinner("Loading..."):
+        data1, nifty1, mk1, failed1 = load_universe(one, sym_period)
+    if not data1:
+        st.error(f"No data found for {one[0]}. Check the symbol spelling.")
+        return
+    d = next(iter(data1.values()))
+    last = d.iloc[-1]
+    m6 = float(last["MOM126"]) * 100 if pd.notna(last["MOM126"]) else None
+    trend = "Uptrend" if bool(last["Above200"]) else "Below 200-day avg"
+    tiles([
+        ("payments", "Last close", f"₹{last['Close']:,.2f}", str(d.index[-1].date()), ""),
+        ("trending_up", "6-month return", f"{m6:+.1f}%" if m6 is not None else "—", trend, tone(m6 or 0)),
+    ])
+    st.line_chart(d[["Close", "EMA20", "EMA50", "SMA200"]].tail(250), height=300,
+                  color=[NAVY, "#F59E0B", "#3B82F6", ACC])
+    with st.expander("Breakout backtest on this stock (A / B)"):
+        style = st.radio("Exit style", ["Fixed target (A)", "Trailing stop (B)"], horizontal=True)
+        r1 = run_backtest(data1, mk1, capital, risk, 1, daily_limit, atr_mult, rr, cost_side,
+                          exit_mode="target" if style.startswith("Fixed") else "trail", trail_mult=trail_mult)
+        if r1 is None:
+            st.info("Not enough history for a backtest on this stock.")
+        else:
+            s1 = summarize(r1["equity"], r1["trades"], capital)
+            b1, b2 = st.columns(2)
+            b1.metric("Strategy return", f"{s1['total']:.1f}%")
+            b2.metric("Closed trades", s1["n"])
+            if s1["n"]:
+                st.dataframe(r1["trades"], width="stretch", hide_index=True)
+            st.caption("One stock alone is a weak test. The Backtest page (all stocks) matters more.")
+
+
+# ================================== SETTINGS ==================================
+def page_settings():
+    section("account_balance", "Money")
+    c1, c2 = st.columns(2)
+    c1.number_input("Capital (₹)", min_value=10000, max_value=10000000, step=5000, key="capital")
+    c2.number_input("Momentum: stocks to hold", min_value=3, max_value=15, key="top_n")
+    st.toggle("Market filter: buy only when Nifty 50 is above its 200-day average", key="use_mf")
+
+    section("receipt", "Costs")
+    c3, c4 = st.columns(2)
+    c3.number_input("Trading cost per side (%)", min_value=0.0, max_value=1.0, step=0.01, key="cost_pct",
+                    help="Rough estimate for delivery trades: STT, stamp duty, exchange, GST, DP charges.")
+    c4.number_input("Slippage per side (%)", min_value=0.0, max_value=1.0, step=0.01, key="slip_pct")
+
+    with st.expander("Breakout strategies A / B (comparison only)"):
+        d1, d2 = st.columns(2)
+        d1.number_input("Risk per trade (₹)", min_value=100, max_value=100000, step=100, key="risk")
+        d2.number_input("Max open trades", min_value=1, max_value=10, key="max_pos")
+        d3, d4 = st.columns(2)
+        d3.number_input("Max loss per day (₹)", min_value=100, max_value=1000000, step=100, key="daily_limit")
+        d4.number_input("Breakout lookback (days)", min_value=10, max_value=100, key="breakout_days")
+        st.slider("Stop-loss distance (× ATR)", 1.0, 4.0, step=0.5, key="atr_mult")
+        st.slider("Target (× risk), strategy A", 1.0, 4.0, step=0.5, key="rr")
+        st.slider("Trailing stop (× ATR), strategy B", 2.0, 6.0, step=0.5, key="trail_mult")
+
+    with st.expander("Stock list (Nifty 50)"):
+        st.text_area("NSE symbols, comma separated", height=200, key="symbols_text")
+        st.caption("Check the latest list on niftyindices.com. Symbols that fail to load are skipped.")
+
+    section("menu_book", "How the strategies work")
+    with st.expander("C. Monthly momentum (main strategy)"):
+        st.markdown(f"""
+- On the **last trading day of each month**, rank Nifty 50 stocks that are above their 200-day average by their 6-month return.
+- Hold the **top {top_n}** in equal amounts (about {money(capital / top_n)} each).
+- Keep an old holding while it stays in the top {2 * top_n}; sell it when it drops out.
+- If Nifty 50 is below its 200-day average, sell everything and wait in cash.
+- About 15–30 minutes of work per month.
+""")
+    with st.expander("A / B. Breakout (comparison only)"):
+        st.markdown(f"""
+- Buy when the close is above the 200-day average, EMA20 is above EMA50, and the close breaks the {breakout_days}-day high.
+- Stop-loss: entry − {atr_mult:g} × ATR. **A:** target {rr:g} × risk. **B:** no target, stop trails {trail_mult:g} × ATR below the highest close.
+- Risk {money(risk)} per trade, max {max_pos} trades, no new trade after a {money(daily_limit)} loss day.
+""")
+
+
+PAGES = {"Home": page_home, "Scanner": page_scanner, "Backtest": page_backtest,
+         "Paper": page_paper, "Stock": page_stock, "Settings": page_settings}
+PAGES[page]()
+footer()
