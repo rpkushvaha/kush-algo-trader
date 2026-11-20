@@ -12,7 +12,7 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
@@ -225,8 +225,11 @@ def run_backtest(data, market_ok, capital, risk, max_pos, daily_limit, atr_mult,
     }
 
 
-def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
-    """Monthly momentum rotation.
+def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200, twice_monthly=False, stop_pct=None):
+    """Momentum rotation.
+    twice_monthly=True also rebalances on the last trading day on or before the 15th.
+    stop_pct (e.g. 15): if a holding closes that % below its buy price, it is sold at the next open and the
+    slot stays in cash until the next rebalance.
     On the last trading day of each month (at the close), rank stocks that are above their 200-day average
     by 6-month return. Hold the top N in equal amounts. A holding is kept while it stays in the top 2N
     (reduces churn and costs). If Nifty 50 is below its 200-day average, move to cash.
@@ -246,6 +249,7 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
     cash = float(capital)
     holdings, last_close, trades, eq_vals = {}, {}, [], []
     pending_target = None
+    pending_stops = set()
 
     def value_now(i, use_open=False):
         total = cash
@@ -258,7 +262,23 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
 
     for i in range(warmup, n):
         day = dates[i]
-        # Execute last month-end decision at today's open
+        # Emergency stop-loss exits at today's open (signal came at yesterday's close)
+        for s in list(pending_stops):
+            if s in holdings and not np.isnan(A[s]["Open"][i]):
+                o = A[s]["Open"][i]
+                h = holdings.pop(s)
+                exit_px = o * (1 - cost_side)
+                cash += h["qty"] * exit_px
+                trades.append({
+                    "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
+                    "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"], "Exit reason": "Stop-loss",
+                    "P/L (₹)": round(h["qty"] * (exit_px - h["entry"]), 2),
+                    "Return %": round((exit_px / h["entry"] - 1) * 100, 2), "Days held": (day - h["entry_date"]).days,
+                })
+                pending_stops.discard(s)
+            elif s not in holdings:
+                pending_stops.discard(s)
+        # Execute the last rebalance decision at today's open
         if pending_target is not None:
             for s in list(holdings):
                 if s not in pending_target:
@@ -272,7 +292,7 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
                     trades.append({
                         "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
                         "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"],
-                        "Exit reason": "Monthly rebalance" if mk[i - 1] else "Market filter (cash)",
+                        "Exit reason": "Rebalance" if mk[i - 1] else "Market filter (cash)",
                         "P/L (₹)": round(pnl, 2), "Return %": round((exit_px / h["entry"] - 1) * 100, 2),
                         "Days held": (day - h["entry_date"]).days,
                     })
@@ -288,18 +308,22 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
                 if qty < 1:
                     continue
                 cash -= qty * entry_px
-                holdings[s] = {"qty": qty, "entry": entry_px, "entry_date": day}
+                holdings[s] = {"qty": qty, "entry": entry_px, "raw": o, "entry_date": day}
             pending_target = None
 
-        for s in holdings:
+        for s, h in holdings.items():
             c = A[s]["Close"][i]
             if not np.isnan(c):
                 last_close[s] = c
+                if stop_pct and c <= h.get("raw", h["entry"]) * (1 - stop_pct / 100):
+                    pending_stops.add(s)
         eq_vals.append(value_now(i))
 
-        # Month-end decision
+        # Rebalance decision (month end; also mid-month if twice_monthly)
         is_month_end = (i == n - 1) or (dates[i + 1].month != day.month)
-        if is_month_end and i < n - 1:
+        is_mid = twice_monthly and i < n - 1 and day.day <= 15 and dates[i + 1].day > 15 \
+            and dates[i + 1].month == day.month
+        if (is_month_end or is_mid) and i < n - 1:
             if not mk[i]:
                 pending_target = set()
             else:
@@ -308,7 +332,7 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
                      if A[s]["Above200"][i] and not np.isnan(A[s]["MOM126"][i]) and A[s]["MOM126"][i] > 0],
                     reverse=True)
                 order = [s for _, s in ranked]
-                keep = [s for s in holdings if s in order[: 2 * top_n]]
+                keep = [s for s in holdings if s in order[: 2 * top_n] and s not in pending_stops]
                 target = list(keep)
                 for s in order:
                     if len(target) >= top_n:
@@ -443,7 +467,7 @@ DEFAULTS = {
     "capital": 50000, "risk": 500, "max_pos": 3, "daily_limit": 1000,
     "top_n": 5, "use_mf": True,
     "breakout_days": 20, "atr_mult": 2.0, "rr": 2.0, "trail_mult": 3.0,
-    "cost_pct": 0.15, "slip_pct": 0.05, "symbols_text": DEFAULT_SYMBOLS, "holidays_text": DEFAULT_HOLIDAYS, "nav": "Home",
+    "cost_pct": 0.15, "slip_pct": 0.05, "test_stop": 15, "symbols_text": DEFAULT_SYMBOLS, "holidays_text": DEFAULT_HOLIDAYS, "nav": "Home",
 }
 
 
@@ -1005,6 +1029,12 @@ def show_details(result, cap, nifty):
 
 
 def page_backtest():
+    page_backtest_main()
+    st.divider()
+    page_compare()
+
+
+def page_backtest_main():
     st.caption("Runs A, B and C on the whole stock list with your money rules and costs, "
                "and compares them with simply holding Nifty 50.")
     period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
@@ -1053,13 +1083,63 @@ def page_backtest():
     st.dataframe(comp, width="stretch", hide_index=True)
     st.line_chart(chart, height=320, color=[LINE_COLORS.get(c, "#64748B") for c in chart.columns])
 
-    pick = st.selectbox("See details of", list(valid.keys()), index=len(valid) - 1)
+    pick = st.selectbox("See details of", list(valid.keys()), index=len(valid) - 1, key="bt_pick")
     show_details(valid[pick], cap, nifty)
     st.caption("Limitations: uses today's Nifty 50 list for the past (makes results look better than reality), "
                "dividend-adjusted prices, simple cost estimate, no tax, and orders assumed to fill at the open or "
                "exactly at the stop/target. Past results do not guarantee future results.")
     if bt["failed"]:
         st.caption("Could not load: " + ", ".join(bt["failed"]))
+
+
+def page_compare():
+    section("tune", "Compare momentum versions")
+    st.caption("Tests strategy C four ways: monthly or every 15 days, with or without an emergency stop-loss. "
+               "The Home page keeps using the monthly version without a stop-loss.")
+    stop = int(st.session_state.test_stop)
+    c1, c2 = st.columns(2)
+    c1.selectbox("Data period ", ["5 years", "10 years"], index=1, key="cmp_period")
+    c2.selectbox("Stop-loss to test (%)", [10, 15, 20, 25], key="test_stop")
+    if st.button("Compare 4 versions", type="primary", width="stretch", icon=":material/compare_arrows:"):
+        period = {"5 years": "5y", "10 years": "10y"}[st.session_state.cmp_period]
+        with st.spinner("Running 4 backtests... this can take 1–2 minutes"):
+            data, nifty, mk, failed = load_universe(symbols, period)
+            versions = {
+                "1. Monthly": dict(twice_monthly=False, stop_pct=None),
+                f"2. Monthly + {stop}% stop": dict(twice_monthly=False, stop_pct=stop),
+                "3. Every 15 days": dict(twice_monthly=True, stop_pct=None),
+                f"4. 15 days + {stop}% stop": dict(twice_monthly=True, stop_pct=stop),
+            }
+            res = {k: run_momentum(data, mk, capital, top_n, cost_side, **v) for k, v in versions.items()}
+        st.session_state.cmp = {"res": res, "nifty": nifty, "capital": capital}
+    cmp = st.session_state.get("cmp")
+    if not cmp:
+        return
+    res = {k: v for k, v in cmp["res"].items() if v is not None}
+    if not res:
+        st.error("Not enough data.")
+        return
+    cap = cmp["capital"]
+    rows, chart = [], pd.DataFrame()
+    for name, r in res.items():
+        sm = summarize(r["equity"], r["trades"], cap)
+        stops = int((r["trades"]["Exit reason"] == "Stop-loss").sum()) if len(r["trades"]) else 0
+        rows.append({"Version": name, "Yearly %": round(sm["cagr"], 1), "Worst fall %": round(sm["max_dd"], 1),
+                     "Trades": sm["n"], "Stop exits": stops, "Ending ₹": f"{sm['final']:,.0f}"})
+        chart[name] = r["equity"]
+    comp = pd.DataFrame(rows)
+    best = comp.sort_values("Yearly %", ascending=False).iloc[0]
+    first = next(iter(res.values()))["equity"]
+    st.caption(f"Test period: {first.index[0]:%d %b %Y} to {first.index[-1]:%d %b %Y}")
+    tiles([
+        ("emoji_events", "Highest return", best["Version"].split(". ")[-1], f"{best['Yearly %']}% a year", "good"),
+        ("shield", "Smallest worst fall", comp.sort_values("Worst fall %", ascending=False).iloc[0]["Version"].split(". ")[-1],
+         f"{comp['Worst fall %'].max()}%", ""),
+    ])
+    st.dataframe(comp, width="stretch", hide_index=True)
+    st.line_chart(chart, height=300, color=[ACC, "#6EE7B7", NAVY, "#94A3B8"][: len(chart.columns)])
+    st.caption("A version is only worth switching to if it is clearly better on both return and worst fall. "
+               "Small differences are usually luck. Costs are included; tax is not (more trades means more tax).")
 
 
 # =================================== PAPER ===================================
