@@ -12,7 +12,7 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
-APP_VERSION = "1.9"
+APP_VERSION = "1.10"
 APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
@@ -79,7 +79,6 @@ def add_indicators(df, breakout_days):
     d["Breakout"] = d["Close"] > d["HH"]
     d["Entry"] = d["Trend_OK"] & d["Breakout"] & d["ATR"].notna()
     d["Exit"] = d["Close"] < d["EMA50"]
-    d["EMA10"] = d["Close"].ewm(span=10, adjust=False).mean()
     return d
 
 
@@ -321,114 +320,6 @@ def run_momentum(data, market_ok, capital, top_n, cost_side, warmup=200):
     open_pos = [{
         "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
         "Last close ₹": round(last_close.get(s, h["entry"]), 2),
-        "Open P/L (₹)": round(h["qty"] * (last_close.get(s, h["entry"]) - h["entry"]), 2),
-    } for s, h in holdings.items()]
-    return {"equity": pd.Series(eq_vals, index=dates[warmup:]), "trades": pd.DataFrame(trades),
-            "open": pd.DataFrame(open_pos), "blocked_days": 0}
-
-
-def run_ema10_swing(data, market_ok, capital, slots, cost_side, valid_days=3, max_per_trend=3, warmup=200):
-    """Strategy G (10-EMA swing, rules fixed before testing).
-    Uptrend: close above 10 EMA and 10 EMA higher than 5 days ago. Trigger: a red candle in an uptrend.
-    Entry: if the trigger candle's high is crossed within the next 3 sessions, buy at that price (or the open if it
-    gaps above). A close below the 10 EMA cancels the trigger. Stop-loss: trigger candle's low (checked every day;
-    on the entry day the price is assumed to visit the extreme nearer the open first). Exit: close below 10 EMA -> sell next open.
-    Only the first 3 entries per uptrend (count resets on a close below the 10 EMA). Max 5 stocks, 1/5 capital each."""
-    if not data:
-        return None
-    dates = pd.DatetimeIndex(sorted(set().union(*[set(d.index) for d in data.values()])))
-    n = len(dates)
-    if n < warmup + 30:
-        return None
-    A = {}
-    for s, d in data.items():
-        A[s] = {c: d[c].reindex(dates).to_numpy(dtype=float) for c in ["Open", "High", "Low", "Close", "EMA10", "MOM63"]}
-    mk = (market_ok.astype(float).reindex(dates).ffill().fillna(0).to_numpy() > 0.5) if market_ok is not None else np.ones(n, dtype=bool)
-
-    cash = float(capital)
-    holdings, last_close, trades, eq_vals = {}, {}, [], []
-    triggers = {}                      # symbol -> {"high", "low", "until"}
-    trend_count = {s: 0 for s in A}
-    pending_exits = set()
-    prev_equity = float(capital)
-
-    def close_pos(s, day, raw_px, reason):
-        nonlocal cash
-        h = holdings.pop(s)
-        exit_px = raw_px * (1 - cost_side)
-        cash += h["qty"] * exit_px
-        trades.append({
-            "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2),
-            "Exit date": day.date(), "Exit ₹": round(exit_px, 2), "Qty": h["qty"], "Exit reason": reason,
-            "P/L (₹)": round(h["qty"] * (exit_px - h["entry"]), 2),
-            "Return %": round((exit_px / h["entry"] - 1) * 100, 2), "Days held": (day - h["entry_date"]).days,
-        })
-
-    for i in range(warmup, n):
-        day = dates[i]
-        # 1. Trend exits at the open
-        for s in list(pending_exits):
-            o = A[s]["Open"][i]
-            if s in holdings and not np.isnan(o):
-                close_pos(s, day, o, "Close below 10 EMA")
-            pending_exits.discard(s)
-        # 2. Stop-loss on existing positions
-        for s in list(holdings):
-            o, l = A[s]["Open"][i], A[s]["Low"][i]
-            if not np.isnan(l) and l <= holdings[s]["stop"]:
-                close_pos(s, day, min(o, holdings[s]["stop"]) if not np.isnan(o) else holdings[s]["stop"], "Stop-loss")
-        # 3. Breakout entries (stop-buy at the trigger high)
-        if mk[i - 1]:
-            cands = []
-            for s, t in triggers.items():
-                if s in holdings or i > t["until"] or trend_count[s] >= max_per_trend:
-                    continue
-                h, o = A[s]["High"][i], A[s]["Open"][i]
-                if not np.isnan(h) and h >= t["high"]:
-                    m = A[s]["MOM63"][i - 1]
-                    cands.append((m if not np.isnan(m) else -1e9, s))
-            for _, s in sorted(cands, reverse=True):
-                if len(holdings) >= slots:
-                    break
-                t = triggers[s]
-                o = A[s]["Open"][i]
-                raw = max(o, t["high"]) if not np.isnan(o) else t["high"]
-                entry_px = raw * (1 + cost_side)
-                qty = int(min(prev_equity / slots, cash) // entry_px)
-                if qty < 1:
-                    continue
-                cash -= qty * entry_px
-                holdings[s] = {"qty": qty, "entry": entry_px, "stop": t["low"], "entry_date": day}
-                trend_count[s] += 1
-                del triggers[s]
-                # Same-day stop: price is assumed to visit the extreme nearer the open first.
-                # If the low came first, the stop was touched before the entry, so it does not count.
-                lo, hi = A[s]["Low"][i], A[s]["High"][i]
-                if lo <= t["low"] and not np.isnan(o) and (hi - o) <= (o - lo):
-                    close_pos(s, day, t["low"], "Stop-loss")
-        # 4. End of day
-        for s, a in A.items():
-            c, e = a["Close"][i], a["EMA10"][i]
-            if np.isnan(c) or np.isnan(e):
-                continue
-            last_close[s] = c
-            if c < e:
-                trend_count[s] = 0
-                triggers.pop(s, None)
-                if s in holdings:
-                    pending_exits.add(s)
-                continue
-            if s in triggers and i >= triggers[s]["until"]:
-                del triggers[s]
-            e5 = a["EMA10"][i - 5]
-            if s not in holdings and c < a["Open"][i] and not np.isnan(e5) and e > e5:
-                triggers[s] = {"high": a["High"][i], "low": a["Low"][i], "until": i + valid_days}
-        prev_equity = cash + sum(h["qty"] * last_close.get(s, h["entry"]) for s, h in holdings.items())
-        eq_vals.append(prev_equity)
-
-    open_pos = [{
-        "Symbol": short_name(s), "Entry date": h["entry_date"].date(), "Entry ₹": round(h["entry"], 2), "Qty": h["qty"],
-        "Last close ₹": round(last_close.get(s, h["entry"]), 2), "Stop-loss ₹": round(h["stop"], 2),
         "Open P/L (₹)": round(h["qty"] * (last_close.get(s, h["entry"]) - h["entry"]), 2),
     } for s, h in holdings.items()]
     return {"equity": pd.Series(eq_vals, index=dates[warmup:]), "trades": pd.DataFrame(trades),
@@ -1087,10 +978,9 @@ def page_scanner():
 
 
 # ================================== BACKTEST ==================================
-STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum", "G. 10-EMA swing"]
-SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum", STRATS[3]: "G. 10-EMA"}
-LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, STRATS[3]: "#F59E0B",
-               "Nifty 50 buy & hold": NAVY}
+STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum"}
+LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, "Nifty 50 buy & hold": NAVY}
 
 
 def show_details(result, cap, nifty):
@@ -1130,9 +1020,7 @@ def show_details(result, cap, nifty):
 
 
 def page_backtest():
-    st.caption("G (new, from the video): in an uptrend above the 10 EMA, buy when a red candle's high is broken "
-               "within 3 days; stop at its low; sell on a close below the 10 EMA; first 3 trades per trend.")
-    st.caption("Runs A, B, C and G on the whole stock list with your money rules and costs, "
+    st.caption("Runs A, B and C on the whole stock list with your money rules and costs, "
                "and compares them with simply holding Nifty 50.")
     period_label = st.selectbox("Data period", ["2 years", "5 years", "10 years"], index=2)
     period = {"2 years": "2y", "5 years": "5y", "10 years": "10y"}[period_label]
@@ -1144,7 +1032,6 @@ def page_backtest():
                 STRATS[1]: run_backtest(data, mk, capital, risk, max_pos, daily_limit, atr_mult, rr, cost_side,
                                         exit_mode="trail", trail_mult=trail_mult),
                 STRATS[2]: run_momentum(data, mk, capital, top_n, cost_side),
-                STRATS[3]: run_ema10_swing(data, mk, capital, top_n, cost_side),
             }
         st.session_state.bt = {"results": results, "nifty": nifty, "failed": failed, "capital": capital}
     bt = st.session_state.get("bt")
