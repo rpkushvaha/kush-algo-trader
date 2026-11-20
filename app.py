@@ -22,6 +22,12 @@ DEFAULT_SYMBOLS = (
     "SUNPHARMA, TATACONSUM, TATASTEEL, TCS, TECHM, TITAN, TMPV, TRENT, ULTRACEMCO"
 )
 
+# NSE weekday trading holidays (equity). Add next year's list in Settings when NSE publishes it.
+DEFAULT_HOLIDAYS = (
+    "2026-01-15, 2026-01-26, 2026-03-03, 2026-03-26, 2026-03-31, 2026-04-03, 2026-04-14, 2026-05-01, "
+    "2026-05-28, 2026-06-26, 2026-09-14, 2026-10-02, 2026-10-20, 2026-11-10, 2026-11-24, 2026-12-25"
+)
+
 # ============================== ENGINE START ==============================
 
 def parse_symbols(text):
@@ -435,7 +441,7 @@ DEFAULTS = {
     "capital": 50000, "risk": 500, "max_pos": 3, "daily_limit": 1000,
     "top_n": 5, "use_mf": True,
     "breakout_days": 20, "atr_mult": 2.0, "rr": 2.0, "trail_mult": 3.0,
-    "cost_pct": 0.15, "slip_pct": 0.05, "symbols_text": DEFAULT_SYMBOLS, "nav": "Home",
+    "cost_pct": 0.15, "slip_pct": 0.05, "symbols_text": DEFAULT_SYMBOLS, "holidays_text": DEFAULT_HOLIDAYS, "nav": "Home",
 }
 
 
@@ -651,11 +657,35 @@ def market_state(nifty):
     return c > a, c, a
 
 
+def holiday_set():
+    out = set()
+    for part in str(st.session_state.get("holidays_text", "")).replace("\n", ",").split(","):
+        try:
+            out.add(pd.Timestamp(part.strip()).date())
+        except Exception:
+            pass
+    return out
+
+
+def is_trading_day(d):
+    return d.weekday() < 5 and d not in holiday_set()
+
+
 def last_weekday(y, m):
-    d = pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)
-    while d.weekday() >= 5:
+    """Last NSE trading day of the month (skips weekends and listed holidays)."""
+    d = (pd.Timestamp(y, m, 1) + pd.offsets.MonthEnd(0)).date()
+    while not is_trading_day(d):
         d -= pd.Timedelta(days=1)
-    return d.date()
+    return d
+
+
+def first_trading_days(y, m, n=3):
+    d, out = pd.Timestamp(y, m, 1).date(), []
+    while len(out) < n:
+        if is_trading_day(d):
+            out.append(d)
+        d += pd.Timedelta(days=1)
+    return out
 
 
 def next_rebalance(d):
@@ -774,7 +804,7 @@ def page_home():
     picks = momentum_picks(data, mk_now, top_n)
     now = datetime.now(IST)
     month_end = last_weekday(today.year, today.month)
-    in_window = (today == month_end) or (today.day <= 3 and today.weekday() < 5)
+    in_window = (today == month_end) or (today in first_trading_days(today.year, today.month))
     if today == month_end:
         title, note = f"Top {top_n} for this rebalance", (
             "List is final after 3:30 pm today." if now.hour * 60 + now.minute < 930 else "Final list for this month.")
@@ -1160,6 +1190,11 @@ def page_settings():
         st.slider("Stop-loss distance (× ATR)", 1.0, 4.0, step=0.5, key="atr_mult")
         st.slider("Target (× risk), strategy A", 1.0, 4.0, step=0.5, key="rr")
         st.slider("Trailing stop (× ATR), strategy B", 2.0, 6.0, step=0.5, key="trail_mult")
+
+    with st.expander("Market holidays (NSE)"):
+        st.text_area("Weekday holidays, YYYY-MM-DD, comma separated", height=140, key="holidays_text")
+        st.caption("Used to find the last trading day of each month. Add next year's dates from nseindia.com "
+                   "when they are announced.")
 
     with st.expander("Stock list (Nifty 50)"):
         st.text_area("NSE symbols, comma separated", height=200, key="symbols_text")
