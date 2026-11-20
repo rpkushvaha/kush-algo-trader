@@ -12,7 +12,7 @@ except ImportError:
     YF_AVAILABLE = False
 
 IST = ZoneInfo("Asia/Kolkata")
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 APP_DATE = "20 Nov 2026"
 
 # Nifty 50 list as understood in Nov 2026. Verify against niftyindices.com and edit in the sidebar if needed.
@@ -659,13 +659,56 @@ def market_state(nifty):
     return c > a, c, a
 
 
-def holiday_set():
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nse_holidays():
+    """Trading holidays from the NSE website, refreshed once a day.
+    NSE often blocks cloud servers, so failure is normal; the saved list is always used as well."""
+    try:
+        import requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/124.0 Mobile Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.nseindia.com/resources/exchange-communication-holidays",
+        }
+        sess = requests.Session()
+        sess.get("https://www.nseindia.com", headers=headers, timeout=5)
+        r = sess.get("https://www.nseindia.com/api/holiday-master?type=trading", headers=headers, timeout=5)
+        r.raise_for_status()
+        rows = r.json().get("CM") or []
+        dates = set()
+        for row in rows:
+            try:
+                d = datetime.strptime(str(row.get("tradingDate", "")).strip(), "%d-%b-%Y").date()
+                if d.weekday() < 5:
+                    dates.add(d.isoformat())
+            except Exception:
+                pass
+        if not dates:
+            return {"ok": False, "dates": [], "checked": datetime.now(IST).strftime("%d %b %Y, %I:%M %p")}
+        return {"ok": True, "dates": sorted(dates), "checked": datetime.now(IST).strftime("%d %b %Y, %I:%M %p")}
+    except Exception:
+        return {"ok": False, "dates": [], "checked": datetime.now(IST).strftime("%d %b %Y, %I:%M %p")}
+
+
+def saved_holidays():
     out = set()
     for part in str(st.session_state.get("holidays_text", "")).replace("\n", ",").split(","):
         try:
             out.add(pd.Timestamp(part.strip()).date())
         except Exception:
             pass
+    return out
+
+
+def holiday_set():
+    """Saved list + NSE list (if NSE could be reached). A day counts as a holiday if either list has it."""
+    out = saved_holidays()
+    try:
+        out |= {pd.Timestamp(x).date() for x in fetch_nse_holidays()["dates"]}
+    except Exception:
+        pass
     return out
 
 
@@ -1194,9 +1237,18 @@ def page_settings():
         st.slider("Trailing stop (× ATR), strategy B", 2.0, 6.0, step=0.5, key="trail_mult")
 
     with st.expander("Market holidays (NSE)"):
-        st.text_area("Weekday holidays, YYYY-MM-DD, comma separated", height=140, key="holidays_text")
-        st.caption("Used to find the last trading day of each month. Add next year's dates from nseindia.com "
-                   "when they are announced.")
+        nse = fetch_nse_holidays()
+        if nse["ok"]:
+            status("good", "cloud_done", f"Loaded {len(nse['dates'])} holidays from NSE (checked {nse['checked']}). "
+                   "Refreshed once a day.")
+        else:
+            status("info", "cloud_off", f"Could not reach NSE (checked {nse['checked']}). Using the saved list below. "
+                   "This is normal: NSE often blocks cloud servers.")
+        upcoming = sorted(d for d in holiday_set() if d >= today)[:6]
+        if upcoming:
+            st.caption("Next holidays: " + ", ".join(d.strftime("%d %b %Y") for d in upcoming))
+        st.text_area("Saved list (YYYY-MM-DD, comma separated)", height=140, key="holidays_text")
+        st.caption("Used together with the NSE list to find the last trading day of each month.")
 
     with st.expander("Stock list (Nifty 50)"):
         st.text_area("NSE symbols, comma separated", height=200, key="symbols_text")
