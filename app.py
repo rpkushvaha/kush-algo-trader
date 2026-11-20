@@ -508,18 +508,20 @@ header[data-testid="stHeader"] {{ background:#F6F7FB; }}
 .kt-badge {{ margin-left:auto; font-size:11px; font-weight:700; letter-spacing:.8px; color:#0B1F3A;
             background:#D1FAE5; padding:4px 9px; border-radius:999px; }}
 
-/* Navigation: pill buttons in a grey strip, 3 per row on phones, never sliding sideways */
-.st-key-nav {{ background:#ECEFF4; border-radius:14px; padding:5px; }}
-.st-key-nav [data-testid="stButtonGroup"], .st-key-nav div[role="group"] {{ display:grid !important;
-    grid-template-columns:repeat(3, 1fr); gap:5px; width:100%; }}
-@media (min-width: 640px) {{ .st-key-nav [data-testid="stButtonGroup"], .st-key-nav div[role="group"] {{
-    grid-template-columns:repeat(6, 1fr); }} }}
-.st-key-nav button {{ width:100%; margin:0 !important; justify-content:center; border-radius:10px !important;
-    background:transparent; border:1.5px solid transparent; color:#475569; min-height:40px; }}
-.st-key-nav button p {{ font-size:13.5px; font-weight:500; }}
-.st-key-nav button[kind$="Active"], .st-key-nav button[data-testid$="Active"] {{ background:#fff !important;
-    border-color:var(--acc) !important; color:var(--acc) !important; box-shadow:0 1px 3px rgba(15,23,42,.08); }}
-.st-key-nav button[kind$="Active"] p, .st-key-nav button[data-testid$="Active"] p {{ font-weight:700; color:var(--acc); }}
+/* Navigation: 2 rows of 3 buttons; columns stay side by side on phones */
+.st-key-navbox {{ background:#ECEFF4; border-radius:14px; padding:5px; gap:5px !important; }}
+.st-key-navbox [data-testid="stHorizontalBlock"] {{ flex-wrap:nowrap !important; gap:5px !important; }}
+.st-key-navbox [data-testid="stColumn"], .st-key-navbox [data-testid="column"] {{
+    min-width:0 !important; width:auto !important; flex:1 1 0 !important; }}
+.st-key-navbox button {{ width:100%; min-height:42px; padding:4px 2px !important; border-radius:10px !important;
+    background:transparent !important; border:1.5px solid transparent !important; color:#475569 !important;
+    box-shadow:none !important; }}
+.st-key-navbox button p {{ font-size:13px !important; font-weight:500; white-space:nowrap; }}
+.st-key-navbox button[kind="primary"], .st-key-navbox button[data-testid="stBaseButton-primary"] {{
+    background:#fff !important; border-color:var(--acc) !important; color:var(--acc) !important;
+    box-shadow:0 1px 3px rgba(15,23,42,.08) !important; }}
+.st-key-navbox button[kind="primary"] p, .st-key-navbox button[data-testid="stBaseButton-primary"] p {{
+    font-weight:700; color:var(--acc) !important; }}
 
 /* Tiles */
 .kt-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0 14px; }}
@@ -535,7 +537,7 @@ header[data-testid="stHeader"] {{ background:#F6F7FB; }}
 .kt-sec .ms {{ color:var(--acc); font-size:22px; }}
 
 /* Buy / sell boxes */
-.kt-act {{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:4px 0 12px; }}
+.kt-act {{ display:grid; grid-template-columns:1fr; gap:10px; margin:4px 0 12px; }}
 .kt-box {{ background:#fff; border:1px solid var(--line); border-radius:16px; padding:12px 14px; }}
 .kt-box .kt-lab {{ font-weight:600; }}
 .kt-box.sell .kt-lab .ms {{ color:var(--bad); }}
@@ -724,19 +726,21 @@ NAV = ["Home", "Scanner", "Backtest", "Paper", "Stock", "Settings"]
 NAV_ICON = {"Home": ":material/home:", "Scanner": ":material/radar:", "Backtest": ":material/query_stats:",
             "Paper": ":material/receipt_long:", "Stock": ":material/candlestick_chart:", "Settings": ":material/tune:"}
 if st.session_state.nav not in NAV:
-    st.session_state.nav = st.session_state.get("_last_nav", "Home")
+    st.session_state.nav = "Home"
 
 
-def _keep_nav():
-    # Tapping the selected tab again would un-select it; keep the last page instead.
-    if st.session_state.nav is None:
-        st.session_state.nav = st.session_state.get("_last_nav", "Home")
+def _go(name):
+    st.session_state.nav = name
 
 
-st.pills("Navigation", NAV, key="nav", selection_mode="single", label_visibility="collapsed",
-         format_func=lambda x: f"{NAV_ICON[x]} {x}", on_change=_keep_nav)
-page = st.session_state.nav or st.session_state.get("_last_nav", "Home")
-st.session_state["_last_nav"] = page
+with st.container(key="navbox"):
+    for row in (NAV[:3], NAV[3:]):
+        cols = st.columns(3)
+        for col, name in zip(cols, row):
+            col.button(name, key=f"nav_{name}", icon=NAV_ICON[name], width="stretch",
+                       type="primary" if st.session_state.nav == name else "secondary",
+                       on_click=_go, args=(name,))
+page = st.session_state.nav
 
 
 # =================================== HOME ===================================
@@ -885,6 +889,7 @@ def page_scanner():
 
 # ================================== BACKTEST ==================================
 STRATS = ["A. Breakout + fixed target", "B. Breakout + trailing stop", "C. Monthly momentum"]
+SHORT = {STRATS[0]: "A. Breakout", STRATS[1]: "B. Trailing", STRATS[2]: "C. Momentum"}
 LINE_COLORS = {STRATS[0]: "#94A3B8", STRATS[1]: "#CBD5E1", STRATS[2]: ACC, "Nifty 50 buy & hold": NAVY}
 
 
@@ -951,15 +956,15 @@ def page_backtest():
     rows, chart = [], pd.DataFrame(index=first.index)
     for name, r in valid.items():
         s = summarize(r["equity"], r["trades"], cap)
-        rows.append({"Strategy": name, "Ending ₹": round(s["final"]), "Total %": round(s["total"], 1),
-                     "Yearly %": round(s["cagr"], 1), "Worst fall %": round(s["max_dd"], 1), "Trades": s["n"]})
+        rows.append({"Strategy": SHORT[name], "Yearly %": round(s["cagr"], 1), "Worst fall %": round(s["max_dd"], 1),
+                     "Ending ₹": f"{s['final']:,.0f}", "Trades": s["n"]})
         chart[name] = r["equity"]
     if nifty is not None:
         nc = nifty["Close"].reindex(first.index).ffill().bfill()
         bench = cap * nc / nc.iloc[0]
         bs = summarize(bench, pd.DataFrame(), cap)
-        rows.append({"Strategy": "Nifty 50 buy & hold", "Ending ₹": round(bs["final"]), "Total %": round(bs["total"], 1),
-                     "Yearly %": round(bs["cagr"], 1), "Worst fall %": round(bs["max_dd"], 1), "Trades": 0})
+        rows.append({"Strategy": "Nifty 50", "Yearly %": round(bs["cagr"], 1), "Worst fall %": round(bs["max_dd"], 1),
+                     "Ending ₹": f"{bs['final']:,.0f}", "Trades": 0})
         chart["Nifty 50 buy & hold"] = bench
     comp = pd.DataFrame(rows).sort_values("Yearly %", ascending=False).reset_index(drop=True)
     best = comp.iloc[0]
